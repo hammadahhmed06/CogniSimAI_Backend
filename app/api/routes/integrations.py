@@ -37,15 +37,15 @@ def get_workspace_id_from_user(current_user: UserModel = Depends(get_current_use
             logger.info(f"Found workspace {workspace_id} for user {user_id}")
             return workspace_id
         
-        # Use the existing workspace from your database
-        existing_workspace_id = "96bd87ad-95d5-4284-a7c3-fe3ba50c7251"  # Frontend Wizards workspace
-        logger.info(f"Using existing workspace: {existing_workspace_id}")
+        # Use the existing CogniSim Corp workspace
+        existing_workspace_id = "84e53826-b670-41fa-96d3-21febdbc080c"
+        logger.info(f"Using CogniSim Corp workspace: {existing_workspace_id}")
         return existing_workspace_id
         
     except Exception as e:
         logger.error(f"Failed to get workspace for user {current_user.id}: {str(e)}")
-        # Fallback to the existing workspace
-        fallback_workspace_id = "96bd87ad-95d5-4284-a7c3-fe3ba50c7251"  # Frontend Wizards workspace
+        # Fallback to the CogniSim Corp workspace
+        fallback_workspace_id = "84e53826-b670-41fa-96d3-21febdbc080c"
         logger.info(f"Using fallback workspace: {fallback_workspace_id}")
         return fallback_workspace_id
 
