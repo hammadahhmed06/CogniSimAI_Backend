@@ -14,7 +14,7 @@ from app.models.integration_models import (
     IntegrationStatusResponse
 )
 from app.services.jira.jira_sync_service import JiraSyncService
-from app.main import get_current_user, UserModel, supabase, limiter
+from app.core.dependencies import get_current_user, UserModel, supabase, limiter
 
 logger = logging.getLogger("cognisim_ai")
 
@@ -29,23 +29,27 @@ def get_workspace_id_from_user(current_user: UserModel = Depends(get_current_use
     try:
         user_id = str(current_user.id)
         
-        # Try to find existing workspace for user via team_members
-        user_workspace = supabase.table("team_members").select("team_id").eq("user_id", user_id).limit(1).execute()
+        # Try to find existing workspace for user via team_members -> teams -> workspace_id
+        user_teams = supabase.table("team_members").select("team_id").eq("user_id", user_id).limit(1).execute()
         
-        if user_workspace.data:
-            workspace_id = str(user_workspace.data[0]['team_id'])
-            logger.info(f"Found workspace {workspace_id} for user {user_id}")
-            return workspace_id
+        if user_teams.data:
+            team_id = str(user_teams.data[0]['team_id'])
+            # Get the workspace_id from the team
+            team_info = supabase.table("teams").select("workspace_id").eq("id", team_id).execute()
+            if team_info.data:
+                workspace_id = str(team_info.data[0]['workspace_id'])
+                logger.info(f"Found workspace {workspace_id} for user {user_id} via team {team_id}")
+                return workspace_id
         
-        # Use the existing CogniSim Corp workspace
-        existing_workspace_id = "84e53826-b670-41fa-96d3-21febdbc080c"
+        # Use the correct CogniSim Corp workspace ID
+        existing_workspace_id = "84e53826-b670-41fa-96d3-211ebdbc080c"
         logger.info(f"Using CogniSim Corp workspace: {existing_workspace_id}")
         return existing_workspace_id
         
     except Exception as e:
         logger.error(f"Failed to get workspace for user {current_user.id}: {str(e)}")
-        # Fallback to the CogniSim Corp workspace
-        fallback_workspace_id = "84e53826-b670-41fa-96d3-21febdbc080c"
+        # Fallback to the correct CogniSim Corp workspace
+        fallback_workspace_id = "84e53826-b670-41fa-96d3-211ebdbc080c"
         logger.info(f"Using fallback workspace: {fallback_workspace_id}")
         return fallback_workspace_id
 

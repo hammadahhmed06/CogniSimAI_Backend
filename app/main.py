@@ -3,7 +3,6 @@ import logging
 from uuid import UUID
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from supabase import create_client, Client
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -11,12 +10,11 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.core.config import settings # Import the centralized settings object
 from app.services.feature_flags import load_feature_flags, feature_enabled # Import feature flag utilities
 from fastapi.responses import Response
-
+from app.api.routes.integrations import router as integrations_router
+from app.core.dependencies import get_current_user, UserModel, supabase, limiter, ErrorResponse, require_role
 # --- 1. Initial Configuration & Setup ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cognisim_ai")
-
-limiter = Limiter(key_func=get_remote_address)
 
 # --- Step 3 Change: Initialize FastAPI app using settings from config.py ---
 app = FastAPI(
@@ -25,7 +23,6 @@ app = FastAPI(
     description="""
     This API handles all backend services for CogniSim AI.
     It uses Supabase for authentication and provides role-based access control.
-    
     **Key Features:**
     - Secure JWT authentication integrated with Supabase.
     - Role-Based Access Control (RBAC) for sensitive operations.
@@ -56,17 +53,8 @@ if settings.CORS_ORIGINS:
         allow_headers=["*"],
     )
 
-# --- Supabase Client Initialization (using settings) ---
-if not settings.SUPABASE_SERVICE_ROLE_KEY:
-    logger.error("SUPABASE_SERVICE_ROLE_KEY is not configured properly in settings")
-    raise ValueError("SUPABASE_SERVICE_ROLE_KEY must be provided for the application to work")
-
-supabase: Client = create_client(
-    str(settings.SUPABASE_URL),
-    settings.SUPABASE_SERVICE_ROLE_KEY.get_secret_value()
-)
-logger.info("Supabase client initialized successfully.")
-
+# --- Supabase Client and Rate Limiter from dependencies ---
+# These are now imported from app.core.dependencies to avoid circular imports
 
 # --- Step 3 Change: Application Startup Event ---
 @app.on_event("startup")
@@ -78,55 +66,7 @@ async def startup_event():
     await load_feature_flags(supabase)
     logger.info("Application startup complete. Feature flags loaded.")
 
-
-# --- 2. Pydantic Models & Dependencies (largely unchanged) ---
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
-
-class UserModel(BaseModel):
-    id: UUID
-    email: EmailStr
-
-class ErrorResponse(BaseModel):
-    detail: str
-
-bearer_scheme = HTTPBearer()
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> UserModel:
-    token = credentials.credentials
-    try:
-        user_response = supabase.auth.get_user(token)
-        user = getattr(user_response, "user", None)
-        if not user or not getattr(user, "id", None) or not getattr(user, "email", None):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token or user data.")
-        
-        logger.info(f"User successfully authenticated: {user.email} (ID: {user.id})")
-        return UserModel(id=UUID(user.id), email=user.email)
-    except Exception as e:
-        logger.error(f"Token validation failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-def require_role(required_roles: list[str]):
-    async def role_checker(team_id: UUID, current_user: UserModel = Depends(get_current_user)):
-        user_id = current_user.id
-        try:
-            role_query =  supabase.table("team_members").select("role").eq("user_id", user_id).eq("team_id", team_id).single().execute()
-            user_role = role_query.data.get("role") if role_query.data else None
-            if user_role not in required_roles:
-                logger.warning(f"Authorization Failed: User {user_id} with role '{user_role}' attempted action requiring one of {required_roles} on team {team_id}.")
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions.")
-            
-            logger.info(f"Authorization Success: User {user_id} granted access with role '{user_role}'.")
-            return user_role
-        except Exception as e:
-            logger.error(f"RBAC check failed for user {user_id} on team {team_id}: {e}")
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
-    # Return the dependency correctly
-    return Depends(role_checker)
+# --- 2. Dependencies imported from app.core.dependencies to avoid circular imports ---
 
 
 # --- 3. API Endpoints ---
@@ -175,5 +115,5 @@ async def get_epic_suggestions(request: Request, current_user: UserModel = Depen
     }
 
 # --- Include Jira Integration Routes ---
-from app.api.routes.integrations import router as integrations_router
+
 app.include_router(integrations_router)
