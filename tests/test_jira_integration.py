@@ -1,4 +1,4 @@
-# test_jira_integration.py
+# tests/test_jira_integration.py
 # Simple test script for Jira integration
 
 import os
@@ -9,8 +9,8 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Add the current directory to Python path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add the parent directory to Python path to import app modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.jira.jira_client import JiraClient
 from app.services.encryption.simple_credential_store import simple_credential_store

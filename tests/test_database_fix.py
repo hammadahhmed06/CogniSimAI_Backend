@@ -1,4 +1,4 @@
-# test_database_fix.py
+# tests/test_database_fix.py
 # Test that the workspace issue is now resolved
 
 import os
@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Add the current directory to Python path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add the parent directory to Python path to import app modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.services.jira.jira_sync_service import JiraSyncService
 from app.core.config import settings
