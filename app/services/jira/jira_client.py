@@ -8,6 +8,8 @@ from typing import List, Dict, Any, Optional, Tuple
 import time
 from requests.exceptions import RequestException, Timeout, ConnectionError
 
+from app.services.encryption.token_encryption import get_token_encryption_service
+
 logger = logging.getLogger("cognisim_ai")
 
 
@@ -15,20 +17,35 @@ class JiraClient:
     """
     Simplified Jira API client for CogniSim integration.
     Handles connection testing, issue fetching, and error handling.
+    Supports both encrypted and plaintext API tokens.
     """
     
-    def __init__(self, jira_url: str, email: str, api_token: str):
+    def __init__(self, jira_url: str, email: str, api_token: str, is_encrypted: bool = False):
         """
         Initialize Jira client.
         
         Args:
             jira_url: Jira instance URL
             email: User email for authentication
-            api_token: API token for authentication
+            api_token: API token for authentication (plaintext or encrypted)
+            is_encrypted: Whether the api_token is encrypted (default: False)
         """
         self.jira_url = jira_url.rstrip('/')
         self.email = email
-        self.api_token = api_token
+        self.is_encrypted = is_encrypted
+        
+        # Handle encrypted tokens
+        if is_encrypted:
+            try:
+                encryption_service = get_token_encryption_service()
+                self.api_token = encryption_service.decrypt(api_token)
+                logger.info("Successfully decrypted API token for Jira client")
+            except Exception as e:
+                logger.error(f"Failed to decrypt API token: {str(e)}")
+                raise ValueError("Invalid encrypted API token")
+        else:
+            self.api_token = api_token
+            
         self.client: Optional[JIRA] = None
         self.is_connected = False
         
@@ -129,6 +146,9 @@ class JiraClient:
         
         try:
             self._rate_limit()
+            if self.client is None:
+                logger.error("Jira client is None despite connection check")
+                return []
             projects = self.client.projects()
             
             project_list = []
@@ -170,6 +190,11 @@ class JiraClient:
         try:
             self._rate_limit()
             
+            # Check if client is None despite successful connection check
+            if self.client is None:
+                logger.error("Jira client is None despite connection check")
+                return []
+                
             # Build JQL query
             jql = f"project = {project_key} ORDER BY created DESC"
             
@@ -244,6 +269,46 @@ class JiraClient:
             time.sleep(sleep_time)
         
         self.last_request_time = time.time()
+    
+    @classmethod
+    def from_encrypted_credentials(cls, jira_url: str, email: str, encrypted_api_token: str):
+        """
+        Create a JiraClient instance from encrypted credentials.
+        
+        Args:
+            jira_url: Jira server URL
+            email: Email for authentication
+            encrypted_api_token: Encrypted API token
+            
+        Returns:
+            JiraClient: Configured client instance
+        """
+        return cls(
+            jira_url=jira_url,
+            email=email,
+            api_token=encrypted_api_token,
+            is_encrypted=True
+        )
+    
+    @classmethod
+    def from_plaintext_credentials(cls, jira_url: str, email: str, api_token: str):
+        """
+        Create a JiraClient instance from plaintext credentials.
+        
+        Args:
+            jira_url: Jira server URL
+            email: Email for authentication
+            api_token: Plaintext API token
+            
+        Returns:
+            JiraClient: Configured client instance
+        """
+        return cls(
+            jira_url=jira_url,
+            email=email,
+            api_token=api_token,
+            is_encrypted=False
+        )
     
     def close(self):
         """Close the Jira client connection."""

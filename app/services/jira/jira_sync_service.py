@@ -10,6 +10,7 @@ from supabase import Client
 from app.services.jira.jira_client import JiraClient
 from app.services.jira.jira_mapper import JiraFieldMapper
 from app.services.encryption.simple_credential_store import simple_credential_store
+from app.services.encryption.token_encryption import get_token_encryption_service
 from app.models.integration_models import ConnectionStatus, SyncStatus
 
 logger = logging.getLogger("cognisim_ai")
@@ -64,8 +65,9 @@ class JiraSyncService:
                     'connection_status': ConnectionStatus.FAILED
                 }
             
-            # Encode the API token for storage
-            encoded_token = simple_credential_store.encode_credential(jira_api_token)
+            # Encrypt the API token for storage
+            encryption_service = get_token_encryption_service()
+            encrypted_token = encryption_service.encrypt(jira_api_token)
             
             # Check if credentials already exist for this workspace
             existing_creds = self.supabase.table("integration_credentials").select("*").eq("workspace_id", workspace_id).eq("integration_type", "jira").execute()
@@ -75,7 +77,7 @@ class JiraSyncService:
                 'integration_type': 'jira',
                 'jira_url': jira_url,
                 'jira_email': jira_email,
-                'jira_api_token_encrypted': encoded_token,
+                'jira_api_token_encrypted': encrypted_token,
                 'is_active': True,
                 'connection_status': ConnectionStatus.CONNECTED.value,
                 'last_tested_at': datetime.utcnow().isoformat(),
@@ -212,12 +214,11 @@ class JiraSyncService:
                     'sync_status': SyncStatus.FAILED
                 }
             
-            # Initialize Jira client
-            decoded_token = simple_credential_store.decode_credential(credentials['jira_api_token_encrypted'])
-            jira_client = JiraClient(
-                credentials['jira_url'],
-                credentials['jira_email'],
-                decoded_token
+            # Initialize Jira client with encrypted credentials
+            jira_client = JiraClient.from_encrypted_credentials(
+                jira_url=credentials['jira_url'],
+                email=credentials['jira_email'],
+                encrypted_api_token=credentials['jira_api_token_encrypted']
             )
             
             # Test connection
@@ -415,3 +416,85 @@ class JiraSyncService:
             'items_updated': items_updated,
             'errors_count': errors_count
         }
+    
+    async def migrate_credentials_to_encryption(self) -> Dict[str, Any]:
+        """
+        Migrate existing credentials from simple encoding to AES encryption.
+        This method should be run once during deployment to upgrade existing credentials.
+        
+        Returns:
+            Migration result with statistics
+        """
+        try:
+            logger.info("Starting credential migration to encryption")
+            
+            # Get all existing credentials
+            result = self.supabase.table("integration_credentials").select("*").eq("integration_type", "jira").eq("is_active", True).execute()
+            
+            if not result.data:
+                return {
+                    'success': True,
+                    'message': 'No credentials found to migrate',
+                    'migrated_count': 0,
+                    'failed_count': 0
+                }
+            
+            migrated_count = 0
+            failed_count = 0
+            encryption_service = get_token_encryption_service()
+            
+            for credential in result.data:
+                try:
+                    # Skip if already encrypted (check if it looks like encrypted data)
+                    encrypted_token = credential['jira_api_token_encrypted']
+                    if encryption_service.is_encrypted(encrypted_token):
+                        logger.info(f"Credential for workspace {credential['workspace_id']} already encrypted, skipping")
+                        continue
+                    
+                    # Try to decode with old system
+                    try:
+                        plaintext_token = simple_credential_store.decode_credential(encrypted_token)
+                        logger.info(f"Successfully decoded old credential for workspace {credential['workspace_id']}")
+                    except Exception as decode_error:
+                        logger.warning(f"Failed to decode old credential for workspace {credential['workspace_id']}: {decode_error}")
+                        # Assume it might already be plaintext
+                        plaintext_token = encrypted_token
+                    
+                    # Encrypt with new system
+                    new_encrypted_token = encryption_service.encrypt(plaintext_token)
+                    
+                    # Update database
+                    update_result = self.supabase.table("integration_credentials").update({
+                        'jira_api_token_encrypted': new_encrypted_token,
+                        'updated_at': datetime.utcnow().isoformat()
+                    }).eq("id", credential['id']).execute()
+                    
+                    if update_result.data:
+                        migrated_count += 1
+                        logger.info(f"Successfully migrated credential for workspace {credential['workspace_id']}")
+                    else:
+                        failed_count += 1
+                        logger.error(f"Failed to update credential for workspace {credential['workspace_id']}")
+                
+                except Exception as e:
+                    failed_count += 1
+                    logger.error(f"Failed to migrate credential for workspace {credential['workspace_id']}: {str(e)}")
+                    continue
+            
+            logger.info(f"Credential migration completed: {migrated_count} migrated, {failed_count} failed")
+            
+            return {
+                'success': True,
+                'message': f'Migration completed: {migrated_count} credentials migrated, {failed_count} failed',
+                'migrated_count': migrated_count,
+                'failed_count': failed_count
+            }
+            
+        except Exception as e:
+            logger.error(f"Credential migration failed: {str(e)}")
+            return {
+                'success': False,
+                'message': f'Migration failed: {str(e)}',
+                'migrated_count': 0,
+                'failed_count': 0
+            }

@@ -12,3 +12,5 @@ supabase
 jira
 cryptography
 pydantic-settings
+pytest
+pytest-asyncio
