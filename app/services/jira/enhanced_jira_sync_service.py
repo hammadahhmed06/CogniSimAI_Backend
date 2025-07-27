@@ -1,4 +1,4 @@
-# services/jira/jira_sync_service.py
+# services/jira/enhanced_jira_sync_service.py
 # Enhanced service for comprehensive bi-directional Jira synchronization
 
 import logging
@@ -6,7 +6,6 @@ from typing import Dict, Any, List, Optional, Tuple
 import asyncio
 from datetime import datetime, timedelta
 import json
-from supabase import Client
 
 from app.services.jira.jira_client import JiraClient
 from app.services.jira.jira_webhook_handler import JiraWebhookHandler, JiraEventType
@@ -15,20 +14,14 @@ from app.services.jira.jira_mapper import JiraFieldMapper
 logger = logging.getLogger("cognisim_ai")
 
 
-class JiraSyncService:
+class EnhancedJiraSyncService:
     """
     Enhanced service for comprehensive bi-directional Jira synchronization.
     Supports real-time webhooks, bulk operations, and advanced sync features.
     """
     
-    def __init__(self, supabase_client: Client = None):
-        """
-        Initialize the enhanced sync service.
-        
-        Args:
-            supabase_client: Supabase client instance (for compatibility)
-        """
-        self.supabase = supabase_client
+    def __init__(self):
+        """Initialize the enhanced sync service."""
         self.clients: Dict[str, JiraClient] = {}
         self.webhook_handler = JiraWebhookHandler()
         self.mapper = JiraFieldMapper()
@@ -174,55 +167,6 @@ class JiraSyncService:
             
         finally:
             self.sync_in_progress[integration_id] = False
-    
-    # Legacy compatibility methods (from original JiraSyncService)
-    
-    async def save_and_test_credentials(
-        self,
-        workspace_id: str,
-        jira_url: str,
-        jira_email: str,
-        jira_api_token: str
-    ) -> Dict[str, Any]:
-        """
-        Save Jira credentials and test connection.
-        Legacy compatibility method.
-        
-        Args:
-            workspace_id: Workspace ID
-            jira_url: Jira instance URL
-            jira_email: Jira user email
-            jira_api_token: Jira API token
-            
-        Returns:
-            Result dictionary
-        """
-        try:
-            # Create temporary client for testing
-            client = JiraClient(jira_url, jira_email, jira_api_token)
-            success, message = client.connect()
-            
-            if success:
-                # Store credentials if connection successful
-                # Implementation would depend on your credential storage system
-                return {
-                    'success': True,
-                    'message': 'Credentials saved and tested successfully',
-                    'connection_status': 'connected'
-                }
-            else:
-                return {
-                    'success': False,
-                    'message': f'Connection test failed: {message}',
-                    'connection_status': 'failed'
-                }
-                
-        except Exception as e:
-            return {
-                'success': False,
-                'message': f'Error testing credentials: {str(e)}',
-                'connection_status': 'error'
-            }
     
     async def _sync_projects(self, integration_id: str, projects: List[Dict[str, Any]]):
         """Sync project data to local storage."""
@@ -509,12 +453,5 @@ class JiraSyncService:
         logger.info("Enhanced Jira sync service shut down")
 
 
-# Create global instance for use in routes
-# Try to import supabase, but always create a sync_service instance
-try:
-    from app.core.dependencies import supabase
-    sync_service = JiraSyncService(supabase)
-except ImportError:
-    # If dependencies aren't available, create instance without supabase
-    # This allows the module to import without errors during initialization
-    sync_service = JiraSyncService(None)
+# Global enhanced sync service instance
+enhanced_sync_service = EnhancedJiraSyncService()

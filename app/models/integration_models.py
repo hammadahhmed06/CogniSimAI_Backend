@@ -104,6 +104,13 @@ class IntegrationMapping(BaseModel):
     created_at: datetime
 
 
+class AvailableProject(BaseModel):
+    key: str
+    name: str
+    id: Optional[str] = None
+    description: Optional[str] = None
+
+
 class SyncHistoryResponse(BaseModel):
     sync_logs: List[SyncLog]
     total_count: int
@@ -119,3 +126,4 @@ class IntegrationStatusResponse(BaseModel):
     jira_email: Optional[str]
     last_tested_at: Optional[datetime]
     last_sync_at: Optional[datetime]
+    available_projects: List[AvailableProject] = Field(default=[], description="Available Jira projects")
