@@ -4,7 +4,7 @@
 import logging
 from jira import JIRA
 from jira.exceptions import JIRAError
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 import time
 from requests.exceptions import RequestException, Timeout, ConnectionError
 
@@ -72,7 +72,9 @@ class JiraClient:
             )
             
             # Test connection by getting current user info
-            user_info = self.client.myself()
+            client = self.client
+            assert client is not None
+            user_info = client.myself()
             self.is_connected = True
             
             # Get display name safely
@@ -103,16 +105,50 @@ class JiraClient:
             return False, error_message
     
     def _handle_jira_error(self, error: JIRAError) -> str:
-        """Handle different types of Jira errors with specific messages."""
-        if hasattr(error, 'status_code'):
-            if error.status_code == 401:
+        """Handle different types of Jira errors with specific messages.
+
+        Attempts to surface the server-provided error payload for 400 responses so
+        users can see field-level messages like "Field 'priority' cannot be set".
+        """
+        try:
+            status = getattr(error, 'status_code', None)
+            # Try to extract detailed message from response text if present
+            detail = None
+            resp = getattr(error, 'response', None)
+            if resp is not None:
+                try:
+                    text = getattr(resp, 'text', '') or ''
+                    if text:
+                        import json as _json
+                        try:
+                            payload = _json.loads(text)
+                            # Common Jira error shapes
+                            if isinstance(payload, dict):
+                                if payload.get('errorMessages'):
+                                    detail = "; ".join([str(m) for m in payload.get('errorMessages', [])])
+                                elif payload.get('errors'):
+                                    # Collect key: message pairs
+                                    pairs = [f"{k}: {v}" for k, v in payload.get('errors', {}).items()]
+                                    if pairs:
+                                        detail = "; ".join(pairs)
+                        except Exception:
+                            # Fallback to raw text
+                            detail = text[:500]
+                except Exception:
+                    pass
+
+            if status == 401:
                 return "Invalid credentials - check your email and API token"
-            elif error.status_code == 403:
+            elif status == 403:
                 return "Access denied - insufficient permissions"
-            elif error.status_code == 404:
+            elif status == 404:
                 return "Jira instance not found - check your URL"
-            elif error.status_code == 429:
+            elif status == 429:
                 return "Rate limit exceeded - please wait and try again"
+            elif status == 400 and detail:
+                return f"Bad request: {detail}"
+        except Exception:
+            pass
         return f"Jira API error: {str(error)}"
 
     def test_connection(self) -> Tuple[bool, str]:
@@ -126,7 +162,9 @@ class JiraClient:
             return self.connect()
         
         try:
-            server_info = self.client.server_info()
+            client = self.client
+            assert client is not None
+            server_info = client.server_info()
             version = server_info.get('version', 'unknown') if isinstance(server_info, dict) else 'unknown'
             return True, f"Connection valid - Jira version {version}"
             
@@ -149,7 +187,9 @@ class JiraClient:
             if self.client is None:
                 logger.error("Jira client is None despite connection check")
                 return []
-            projects = self.client.projects()
+            client = self.client
+            assert client is not None
+            projects = client.projects()
             
             project_list = []
             for project in projects:
@@ -201,7 +241,9 @@ class JiraClient:
             logger.info(f"Fetching issues from project {project_key} (max: {max_results})")
             
             # Search issues
-            issues = self.client.search_issues(
+            client = self.client
+            assert client is not None
+            issues = client.search_issues(
                 jql,
                 maxResults=max_results,
                 expand='changelog'
@@ -289,7 +331,9 @@ class JiraClient:
                 issue_fields['components'] = [{'name': comp} for comp in kwargs['components']]
             
             # Create the issue
-            new_issue = self.client.create_issue(fields=issue_fields)
+            client = self.client
+            assert client is not None  # for type checkers
+            new_issue = client.create_issue(fields=issue_fields)
             issue_key = getattr(new_issue, 'key', str(new_issue))
             
             logger.info(f"Successfully created issue {issue_key}")
@@ -322,21 +366,40 @@ class JiraClient:
             self._rate_limit()
             
             # Get the issue first
-            issue = self.client.issue(issue_key)
+            client = self.client
+            assert client is not None
+            issue = client.issue(issue_key)
             
             # Update fields
-            update_fields = {}
+            update_fields: Dict[str, Any] = {}
             for field, value in fields_to_update.items():
+                # Pass through dictionaries as-is to allow callers to specify exact payloads
+                if isinstance(value, dict):
+                    update_fields[field] = value
+                    continue
+
                 if field == 'summary':
                     update_fields['summary'] = value
                 elif field == 'description':
                     update_fields['description'] = value
                 elif field == 'priority':
-                    update_fields['priority'] = {'name': value}
+                    # Accept either name or id
+                    if isinstance(value, str) and value.isdigit():
+                        update_fields['priority'] = {'id': value}
+                    else:
+                        update_fields['priority'] = {'name': value}
                 elif field == 'assignee':
-                    update_fields['assignee'] = {'name': value}
+                    # Jira Cloud uses accountId, Jira Server/Data Center may use name
+                    if isinstance(value, str):
+                        # Heuristic: accountId often contains ':' or is long/UUID-like
+                        if ':' in value or len(value) >= 16:
+                            update_fields['assignee'] = {'accountId': value}
+                        else:
+                            update_fields['assignee'] = {'name': value}
+                    else:
+                        update_fields['assignee'] = value  # fallback
                 elif field == 'status':
-                    # Status updates require transitions
+                    # Status updates require transitions API
                     continue
                 else:
                     update_fields[field] = value
@@ -374,8 +437,10 @@ class JiraClient:
         try:
             self._rate_limit()
             
-            issue = self.client.issue(issue_key)
-            transitions = self.client.transitions(issue)
+            client = self.client
+            assert client is not None
+            issue = client.issue(issue_key)
+            transitions = client.transitions(issue)
             
             # Find the transition
             transition_id = None
@@ -389,7 +454,7 @@ class JiraClient:
                 return False, f"Transition '{transition_name}' not available. Available: {available}"
             
             # Perform transition
-            self.client.transition_issue(issue, transition_id)
+            client.transition_issue(issue, transition_id)
             logger.info(f"Successfully transitioned issue {issue_key} to {transition_name}")
             return True, f"Issue {issue_key} transitioned to {transition_name}"
             
@@ -401,6 +466,42 @@ class JiraClient:
             error_msg = f"Unexpected error: {str(e)}"
             logger.error(error_msg)
             return False, error_msg
+
+    def get_issue(self, issue_key: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single issue by key and return as dict."""
+        if not self._ensure_connected():
+            return None
+        try:
+            self._rate_limit()
+            client = self.client
+            assert client is not None
+            issue = client.issue(issue_key, expand='changelog')
+            return self._convert_issue_to_dict(issue)
+        except Exception as e:
+            logger.error(f"Failed to fetch issue {issue_key}: {str(e)}")
+            return None
+
+    def get_issue_editmeta(self, issue_key: str) -> Dict[str, Any]:
+        """Return edit metadata for an issue, including which fields are editable.
+
+        Useful for checking if 'priority' is editable and what values are allowed.
+        """
+        if not self._ensure_connected():
+            return {}
+        try:
+            self._rate_limit()
+            client = self.client
+            assert client is not None
+            meta = client.editmeta(issue_key)
+            # Ensure it's JSON-serializable
+            if hasattr(meta, 'raw'):
+                return getattr(meta, 'raw', {})
+            if isinstance(meta, dict):
+                return meta
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to get editmeta for {issue_key}: {str(e)}")
+            return {}
     
     def add_comment(self, issue_key: str, comment_body: str) -> Tuple[bool, str]:
         """
@@ -419,7 +520,9 @@ class JiraClient:
         try:
             self._rate_limit()
             
-            self.client.add_comment(issue_key, comment_body)
+            client = self.client
+            assert client is not None
+            client.add_comment(issue_key, comment_body)
             logger.info(f"Successfully added comment to issue {issue_key}")
             return True, f"Comment added to issue {issue_key}"
             
@@ -448,7 +551,9 @@ class JiraClient:
         try:
             self._rate_limit()
             
-            issue = self.client.issue(issue_key)
+            client = self.client
+            assert client is not None
+            issue = client.issue(issue_key)
             issue.delete()
             logger.info(f"Successfully deleted issue {issue_key}")
             return True, f"Issue {issue_key} deleted successfully"
@@ -481,7 +586,9 @@ class JiraClient:
             self._rate_limit()
             
             # Get assignable users for the project
-            users = self.client.search_assignable_users_for_projects('', projectKeys=project_key)
+            client = self.client
+            assert client is not None
+            users = client.search_assignable_users_for_projects('', projectKeys=project_key)
             
             user_list = []
             for user in users:
@@ -512,14 +619,13 @@ class JiraClient:
         """
         if not self._ensure_connected():
             return []
-        
         try:
             self._rate_limit()
-            
-            project = self.client.project(project_key)
+            client = self.client
+            assert client is not None
+            project = client.project(project_key)
             issue_types = getattr(project, 'issueTypes', [])
-            
-            type_list = []
+            type_list: List[Dict[str, Any]] = []
             for issue_type in issue_types:
                 type_dict = {
                     'id': getattr(issue_type, 'id', ''),
@@ -528,17 +634,36 @@ class JiraClient:
                     'subtask': getattr(issue_type, 'subtask', False)
                 }
                 type_list.append(type_dict)
-            
             logger.info(f"Retrieved {len(type_list)} issue types for project {project_key}")
             return type_list
-            
         except Exception as e:
             logger.error(f"Failed to get issue types for project {project_key}: {str(e)}")
+            return []
+
+    def get_priorities(self) -> List[Dict[str, Any]]:
+        """Return global list of priorities (id + name)."""
+        if not self._ensure_connected():
+            return []
+        try:
+            self._rate_limit()
+            client = self.client
+            assert client is not None
+            pris = client.priorities()
+            out: List[Dict[str, Any]] = []
+            for p in pris:
+                out.append({
+                    'id': getattr(p, 'id', ''),
+                    'name': getattr(p, 'name', ''),
+                    'statusColor': getattr(p, 'statusColor', None),
+                })
+            return out
+        except Exception as e:
+            logger.error(f"Failed to get priorities: {str(e)}")
             return []
     
     # Sprint Management (for Agile projects)
     
-    def get_active_sprints(self, board_id: str) -> List[Dict[str, Any]]:
+    def get_active_sprints(self, board_id: Union[str, int]) -> List[Dict[str, Any]]:
         """
         Get active sprints for a board.
         
@@ -554,7 +679,12 @@ class JiraClient:
         try:
             self._rate_limit()
             
-            sprints = self.client.sprints(board_id, state='active')
+            client = self.client
+            assert client is not None
+            bid: Union[str, int] = board_id
+            if isinstance(board_id, str) and board_id.isdigit():
+                bid = int(board_id)
+            sprints = client.sprints(bid, state='active')
             
             sprint_list = []
             for sprint in sprints:
@@ -575,7 +705,7 @@ class JiraClient:
             logger.error(f"Failed to get active sprints for board {board_id}: {str(e)}")
             return []
     
-    def add_issues_to_sprint(self, sprint_id: str, issue_keys: List[str]) -> Tuple[bool, str]:
+    def add_issues_to_sprint(self, sprint_id: Union[str, int], issue_keys: List[str]) -> Tuple[bool, str]:
         """
         Add issues to a sprint.
         
@@ -592,7 +722,15 @@ class JiraClient:
         try:
             self._rate_limit()
             
-            self.client.add_issues_to_sprint(sprint_id, issue_keys)
+            client = self.client
+            assert client is not None
+            # Convert to int if possible for API expectations
+            sid_int: int
+            if isinstance(sprint_id, int):
+                sid_int = sprint_id
+            else:
+                sid_int = int(sprint_id) if str(sprint_id).isdigit() else 0
+            client.add_issues_to_sprint(sid_int, issue_keys)
             logger.info(f"Successfully added {len(issue_keys)} issues to sprint {sprint_id}")
             return True, f"Added {len(issue_keys)} issues to sprint"
             
@@ -683,8 +821,9 @@ class JiraClient:
     
     # Advanced Search and Filtering
     
-    def search_issues_jql(self, jql: str, max_results: int = 50, 
-                         fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    def search_issues_jql(self, jql: str, max_results: int = 50,
+                         fields: Optional[List[str]] = None,
+                         start_at: int = 0) -> Dict[str, Any]:
         """
         Search issues using JQL (Jira Query Language).
         
@@ -694,27 +833,32 @@ class JiraClient:
             fields: Specific fields to retrieve
             
         Returns:
-            List of issue dictionaries
+            Dict with issues list and total count { 'issues': [...], 'total': int }
         """
         if not self._ensure_connected():
-            return []
+            return { 'issues': [], 'total': 0 }
         
         try:
             self._rate_limit()
             
             # Set default fields if none specified
             if fields is None:
-                fields = ['summary', 'status', 'assignee', 'created', 'updated']
+                # Include priority and issuetype so UI can render them in the table
+                fields = ['summary', 'status', 'assignee', 'priority', 'issuetype', 'created', 'updated']
             
-            issues = self.client.search_issues(
-                jql, 
+            client = self.client
+            assert client is not None
+            issues_result = client.search_issues(
+                jql,
                 maxResults=max_results,
+                startAt=start_at,
                 fields=fields,
                 expand='changelog'
             )
             
             issue_list = []
-            for issue in issues:
+            total_count = getattr(issues_result, 'total', None)
+            for issue in issues_result:
                 try:
                     issue_dict = self._convert_issue_to_dict(issue)
                     if issue_dict:
@@ -723,11 +867,33 @@ class JiraClient:
                     logger.warning(f"Could not convert issue: {str(e)}")
                     continue
             
-            logger.info(f"JQL search returned {len(issue_list)} issues")
-            return issue_list
+            logger.info(f"JQL search returned {len(issue_list)} issues (total={total_count})")
+            return { 'issues': issue_list, 'total': int(total_count) if isinstance(total_count, int) else len(issue_list) }
             
         except Exception as e:
             logger.error(f"JQL search failed: {str(e)}")
+            return { 'issues': [], 'total': 0 }
+
+    def get_transitions(self, issue_key: str) -> List[Dict[str, Any]]:
+        """Return available transitions for an issue."""
+        if not self._ensure_connected():
+            return []
+        try:
+            self._rate_limit()
+            client = self.client
+            assert client is not None
+            issue = client.issue(issue_key)
+            transitions = client.transitions(issue)
+            out: List[Dict[str, Any]] = []
+            for t in transitions:
+                out.append({
+                    'id': t.get('id'),
+                    'name': t.get('name'),
+                    'to': (t.get('to') or {}).get('name'),
+                })
+            return out
+        except Exception as e:
+            logger.error(f"Failed to get transitions for {issue_key}: {str(e)}")
             return []
     
     def get_issue_history(self, issue_key: str) -> List[Dict[str, Any]]:
@@ -746,7 +912,9 @@ class JiraClient:
         try:
             self._rate_limit()
             
-            issue = self.client.issue(issue_key, expand='changelog')
+            client = self.client
+            assert client is not None
+            issue = client.issue(issue_key, expand='changelog')
             changelog = getattr(issue, 'changelog', {})
             histories = getattr(changelog, 'histories', [])
             
@@ -834,7 +1002,9 @@ class JiraClient:
         """Close the Jira client connection."""
         if self.client:
             try:
-                self.client.close()
+                client = self.client
+                if client is not None:
+                    client.close()
             except:
                 pass
         self.client = None

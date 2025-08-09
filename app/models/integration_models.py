@@ -119,6 +119,7 @@ class SyncHistoryResponse(BaseModel):
 
 
 class IntegrationStatusResponse(BaseModel):
+    integration_id: Optional[UUID] = None
     is_connected: bool
     connection_status: ConnectionStatus
     integration_type: IntegrationType

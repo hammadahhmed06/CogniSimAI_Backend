@@ -7,8 +7,10 @@ import asyncio
 from datetime import datetime, timedelta
 import json
 from supabase import Client
+from typing import Optional
 
 from app.services.jira.jira_client import JiraClient
+from app.services.encryption.simple_credential_store import simple_credential_store
 from app.services.jira.jira_webhook_handler import JiraWebhookHandler, JiraEventType
 from app.services.jira.jira_mapper import JiraFieldMapper
 
@@ -21,7 +23,7 @@ class JiraSyncService:
     Supports real-time webhooks, bulk operations, and advanced sync features.
     """
     
-    def __init__(self, supabase_client: Client = None):
+    def __init__(self, supabase_client: Optional[Client] = None):
         """
         Initialize the enhanced sync service.
         
@@ -201,27 +203,68 @@ class JiraSyncService:
             # Create temporary client for testing
             client = JiraClient(jira_url, jira_email, jira_api_token)
             success, message = client.connect()
-            
-            if success:
-                # Store credentials if connection successful
-                # Implementation would depend on your credential storage system
-                return {
-                    'success': True,
-                    'message': 'Credentials saved and tested successfully',
-                    'connection_status': 'connected'
-                }
-            else:
-                return {
-                    'success': False,
-                    'message': f'Connection test failed: {message}',
-                    'connection_status': 'failed'
-                }
-                
+
+            # Encode the token for storage (dev-safe)
+            encoded_token = simple_credential_store.encode_credential(jira_api_token)
+
+            # Prepare record
+            record = {
+                'workspace_id': workspace_id,
+                'integration_type': 'jira',
+                'jira_url': jira_url,
+                'jira_email': jira_email,
+                'jira_api_token_encrypted': encoded_token,
+                'connection_status': 'connected' if success else 'failed',
+                'last_tested_at': datetime.utcnow().isoformat()
+            }
+
+            # Upsert into integration_credentials (fallback to insert/update if upsert not configured)
+            try:
+                if self.supabase is None:
+                    logger.warning("Supabase client not provided, skipping database operations")
+                    integration_id = None
+                else:
+                    # Try to find existing
+                    existing = self.supabase.table('integration_credentials') \
+                        .select('id') \
+                        .eq('workspace_id', workspace_id) \
+                        .eq('integration_type', 'jira') \
+                        .limit(1).execute()
+
+                    if existing.data:
+                        cred_id = existing.data[0]['id']
+                        self.supabase.table('integration_credentials') \
+                            .update(record).eq('id', cred_id).execute()
+                        integration_id = str(cred_id)
+                    else:
+                        inserted = self.supabase.table('integration_credentials') \
+                            .insert(record).execute()
+                        integration_id = str(inserted.data[0]['id']) if inserted.data else None
+            except Exception as db_e:
+                logger.warning(f"Credential save fallback path error: {str(db_e)}")
+                integration_id = None
+
+            return {
+                'success': bool(success),
+                'message': 'Credentials saved and tested successfully' if success else f'Connection test failed: {message}',
+                'connection_status': 'connected' if success else 'failed',
+                'integration_id': integration_id
+            }
+
         except Exception as e:
+            logger.error(f"Error testing/saving credentials: {str(e)}")
+            # Attempt to mark as failed if record exists
+            try:
+                if self.supabase is not None:
+                    self.supabase.table('integration_credentials') \
+                        .update({'connection_status': 'failed', 'last_tested_at': datetime.utcnow().isoformat()}) \
+                        .eq('workspace_id', workspace_id).eq('integration_type', 'jira').execute()
+            except Exception:
+                pass
             return {
                 'success': False,
                 'message': f'Error testing credentials: {str(e)}',
-                'connection_status': 'error'
+                'connection_status': 'failed'
             }
     
     async def _sync_projects(self, integration_id: str, projects: List[Dict[str, Any]]):
@@ -423,8 +466,8 @@ class JiraSyncService:
     
     # Search and filtering
     
-    async def search_issues(self, integration_id: str, jql: str, 
-                           max_results: int = 50) -> List[Dict[str, Any]]:
+    async def search_issues(self, integration_id: str, jql: str,
+                           max_results: int = 50, start_at: int = 0) -> Dict[str, Any]:
         """
         Search issues using JQL with local caching.
         
@@ -434,18 +477,18 @@ class JiraSyncService:
             max_results: Maximum results to return
             
         Returns:
-            List of issue dictionaries
+            Dict with issues and total
         """
         if integration_id not in self.clients:
-            return []
+            return { 'issues': [], 'total': 0 }
         
         try:
             client = self.clients[integration_id]
-            return client.search_issues_jql(jql, max_results)
+            return client.search_issues_jql(jql, max_results=max_results, start_at=start_at)
             
         except Exception as e:
             logger.error(f"Error searching issues: {str(e)}")
-            return []
+            return { 'issues': [], 'total': 0 }
     
     # Status and monitoring
     
@@ -454,9 +497,16 @@ class JiraSyncService:
         if integration_id not in self.clients:
             return {'status': 'not_found'}
         
+        # Ensure datetime is JSON serializable (ISO 8601 string)
+        last_sync_dt = self.last_sync_times.get(integration_id)
+        if isinstance(last_sync_dt, datetime):
+            last_sync_val = last_sync_dt.isoformat()
+        else:
+            last_sync_val = last_sync_dt if last_sync_dt is None else str(last_sync_dt)
+
         return {
             'status': 'active',
-            'last_sync': self.last_sync_times.get(integration_id),
+            'last_sync': last_sync_val,
             'sync_in_progress': self.sync_in_progress.get(integration_id, False),
             'real_time_enabled': self.real_time_enabled,
             'client_connected': self.clients[integration_id].is_connected

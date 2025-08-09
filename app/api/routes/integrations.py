@@ -6,6 +6,7 @@ from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -17,6 +18,7 @@ from app.models.integration_models import (
 from app.services.jira.jira_sync_service import sync_service, JiraSyncService
 from app.services.jira.jira_webhook_handler import webhook_handler
 from app.core.dependencies import get_current_user, UserModel, supabase, limiter
+from pydantic import BaseModel
 
 logger = logging.getLogger("cognisim_ai")
 
@@ -59,6 +61,21 @@ def get_workspace_id_from_user(current_user: UserModel = Depends(get_current_use
 def get_jira_sync_service() -> JiraSyncService:
     """Dependency to get JiraSyncService instance."""
     return JiraSyncService(supabase)
+
+
+class TransitionRequest(BaseModel):
+    issue_key: str
+    transition: str
+
+
+class AssignRequest(BaseModel):
+    issue_key: str
+    assignee: str
+
+
+class CommentRequest(BaseModel):
+    issue_key: str
+    comment: str
 
 
 @router.post(
@@ -118,11 +135,11 @@ async def get_jira_status(
     Get current Jira integration status.
     """
     try:
-        # Get credentials to check if Jira is connected  
-        # For now, return a basic status since _get_credentials method doesn't exist yet
-        credentials = None
-        
-        if not credentials:
+        # Look up stored credentials
+        cred_result = supabase.table("integration_credentials").select("*") \
+            .eq("workspace_id", workspace_id).eq("integration_type", "jira").limit(1).execute()
+
+        if not cred_result.data:
             return IntegrationStatusResponse(
                 is_connected=False,
                 connection_status=ConnectionStatus.DISCONNECTED,
@@ -133,37 +150,45 @@ async def get_jira_status(
                 jira_email="",
                 available_projects=[]
             )
-        
-        # Test connection to see if credentials are still valid
+
+        credentials = cred_result.data[0]
+        integration_id = credentials.get('id')
+
         from app.services.encryption.simple_credential_store import simple_credential_store
         from app.services.jira.jira_client import JiraClient
-        
-        decoded_token = simple_credential_store.decode_credential(credentials['jira_api_token_encrypted'])
+
+        decoded_token = simple_credential_store.decode_credential(credentials.get('jira_api_token_encrypted', ''))
         jira_client = JiraClient(
-            credentials['jira_url'],
-            credentials['jira_email'],
+            credentials.get('jira_url', ''),
+            credentials.get('jira_email', ''),
             decoded_token
         )
-        
-        success, message = jira_client.test_connection()
+
+        success, message = jira_client.connect()
+        # If connected, make sure the sync service has a client registered
+        try:
+            if success and integration_id:
+                from app.services.jira.jira_sync_service import sync_service
+                sync_service.clients[str(integration_id)] = jira_client
+        except Exception as e:
+            logger.warning(f"Could not register Jira client for sync: {str(e)}")
         available_projects = []
-        
         if success:
-            # Get available projects
             projects = jira_client.get_all_projects()
             available_projects = [{'key': p['key'], 'name': p['name']} for p in projects[:10]]
-            
+
         return IntegrationStatusResponse(
+            integration_id=integration_id,
             is_connected=success,
             connection_status=ConnectionStatus.CONNECTED if success else ConnectionStatus.FAILED,
             integration_type=IntegrationType.JIRA,
-            last_tested_at=None,
-            last_sync_at=credentials.get('last_sync_time') if credentials else None,
-            jira_url=credentials['jira_url'] if credentials else "",
-            jira_email=credentials['jira_email'] if credentials else "",
+            last_tested_at=credentials.get('last_tested_at'),
+            last_sync_at=credentials.get('last_sync_time'),
+            jira_url=credentials.get('jira_url', ''),
+            jira_email=credentials.get('jira_email', ''),
             available_projects=[AvailableProject(key=p['key'], name=p['name']) for p in available_projects]
         )
-        
+
     except Exception as e:
         logger.error(f"Failed to get Jira status: {str(e)}")
         raise HTTPException(
@@ -422,6 +447,137 @@ async def update_jira_issue(
             content={"error": f"Failed to update issue: {str(e)}"}
         )
 
+@router.get("/jira/{integration_id}/issues/{issue_key}")
+async def get_issue_detail(
+    integration_id: str,
+    issue_key: str
+):
+    """Get a single Jira issue."""
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(status_code=404, content={"error": "integration not found"})
+        issue = client.get_issue(issue_key)
+        if not issue:
+            return JSONResponse(status_code=404, content={"error": "issue not found"})
+        return JSONResponse(status_code=200, content=jsonable_encoder(issue))
+    except Exception as e:
+        logger.error(f"Error getting issue {issue_key}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to get issue: {str(e)}"})
+
+@router.get("/jira/{integration_id}/issues/{issue_key}/editmeta")
+async def get_issue_editmeta(
+    integration_id: str,
+    issue_key: str
+):
+    """Get edit metadata for a Jira issue (which fields are editable and allowed values)."""
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(status_code=404, content={"error": "integration not found"})
+        meta = client.get_issue_editmeta(issue_key)
+        return JSONResponse(status_code=200, content=jsonable_encoder(meta))
+    except Exception as e:
+        logger.error(f"Error getting editmeta for {issue_key}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to get editmeta: {str(e)}"})
+
+@router.post("/jira/{integration_id}/issues/transition")
+async def transition_issue(
+    integration_id: str,
+    body: TransitionRequest
+):
+    """Transition a Jira issue to a new status."""
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(status_code=404, content={"error": "integration not found"})
+        ok, msg = client.transition_issue(body.issue_key, body.transition)
+        updated = client.get_issue(body.issue_key) if ok else None
+        return JSONResponse(status_code=200 if ok else 400, content=jsonable_encoder({"success": ok, "message": msg, "issue": updated}))
+    except Exception as e:
+        logger.error(f"Error transitioning issue {body.issue_key}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to transition issue: {str(e)}"})
+
+@router.post("/jira/{integration_id}/issues/assign")
+async def assign_issue(
+    integration_id: str,
+    body: AssignRequest
+):
+    """Assign a Jira issue to a user."""
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(status_code=404, content={"error": "integration not found"})
+        ok, msg = client.update_issue(body.issue_key, {"assignee": body.assignee})
+        updated = client.get_issue(body.issue_key) if ok else None
+        return JSONResponse(status_code=200 if ok else 400, content=jsonable_encoder({"success": ok, "message": msg, "issue": updated}))
+    except Exception as e:
+        logger.error(f"Error assigning issue {body.issue_key}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to assign issue: {str(e)}"})
+
+@router.post("/jira/{integration_id}/issues/comment")
+async def comment_issue(
+    integration_id: str,
+    body: CommentRequest
+):
+    """Add a comment to a Jira issue."""
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(status_code=404, content={"error": "integration not found"})
+        ok, msg = client.add_comment(body.issue_key, body.comment)
+        updated = client.get_issue(body.issue_key) if ok else None
+        return JSONResponse(status_code=200 if ok else 400, content=jsonable_encoder({"success": ok, "message": msg, "issue": updated}))
+    except Exception as e:
+        logger.error(f"Error commenting on issue {body.issue_key}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to add comment: {str(e)}"})
+
+@router.get("/jira/{integration_id}/issues/{issue_key}/transitions")
+async def list_issue_transitions(
+    integration_id: str,
+    issue_key: str
+):
+    """List available transitions for an issue."""
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(status_code=404, content={"error": "integration not found"})
+        transitions = client.get_transitions(issue_key)
+        return JSONResponse(status_code=200, content=jsonable_encoder({"transitions": transitions}))
+    except Exception as e:
+        logger.error(f"Error listing transitions for {issue_key}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to list transitions: {str(e)}"})
+
+@router.get("/jira/{integration_id}/projects/{project_key}/users")
+async def list_project_users(
+    integration_id: str,
+    project_key: str
+):
+    """List assignable users for a project."""
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(status_code=404, content={"error": "integration not found"})
+        users = client.get_project_users(project_key)
+        return JSONResponse(status_code=200, content=jsonable_encoder({"users": users}))
+    except Exception as e:
+        logger.error(f"Error listing users for project {project_key}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to list users: {str(e)}"})
+
+@router.get("/jira/{integration_id}/priorities")
+async def list_priorities(
+    integration_id: str
+):
+    """List global priorities available in Jira."""
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(status_code=404, content={"error": "integration not found"})
+        items = client.get_priorities()
+        return JSONResponse(status_code=200, content=jsonable_encoder({"priorities": items}))
+    except Exception as e:
+        logger.error(f"Error listing priorities: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to list priorities: {str(e)}"})
 
 @router.post("/jira/{integration_id}/issues/bulk")
 async def bulk_create_jira_issues(
@@ -467,7 +623,8 @@ async def bulk_create_jira_issues(
 async def search_jira_issues(
     integration_id: str,
     jql: Optional[str] = Query(None),
-    max_results: int = 50
+    max_results: int = 50,
+    start_at: int = 0
 ):
     """
     Search issues using JQL with local caching.
@@ -479,20 +636,22 @@ async def search_jira_issues(
                 content={"error": "jql parameter is required"}
             )
         
-        issues = await sync_service.search_issues(
+        result = await sync_service.search_issues(
             integration_id=integration_id,
             jql=jql,
-            max_results=max_results
+            max_results=max_results,
+            start_at=start_at
         )
         
         return JSONResponse(
             status_code=200,
-            content={
-                "issues": issues,
-                "total": len(issues),
+            content=jsonable_encoder({
+                "issues": result.get("issues", []),
+                "total": result.get("total", 0),
                 "jql": jql,
-                "max_results": max_results
-            }
+                "max_results": max_results,
+                "start_at": start_at
+            })
         )
             
     except Exception as e:
@@ -511,11 +670,35 @@ async def get_jira_sync_status(
     Get current sync status for a Jira integration.
     """
     try:
-        status = sync_service.get_sync_status(integration_id)
-        
+        status_data = sync_service.get_sync_status(integration_id)
+
+        # If not found (e.g., after reload), try to bootstrap the client from stored credentials
+        if status_data.get('status') == 'not_found':
+            try:
+                cred_result = supabase.table("integration_credentials").select("*") \
+                    .eq("id", integration_id).limit(1).execute()
+                if cred_result.data:
+                    credentials = cred_result.data[0]
+                    from app.services.encryption.simple_credential_store import simple_credential_store
+                    from app.services.jira.jira_client import JiraClient
+                    decoded_token = simple_credential_store.decode_credential(credentials.get('jira_api_token_encrypted', ''))
+                    jira_client = JiraClient(
+                        credentials.get('jira_url', ''),
+                        credentials.get('jira_email', ''),
+                        decoded_token
+                    )
+                    success, _ = jira_client.connect()
+                    if success:
+                        sync_service.clients[str(integration_id)] = jira_client
+                        # Recompute status after registering client
+                        status_data = sync_service.get_sync_status(integration_id)
+            except Exception as e:
+                logger.warning(f"Could not bootstrap Jira client for status: {str(e)}")
+
+        # Ensure any non-serializable values (e.g., datetime) are encoded properly
         return JSONResponse(
             status_code=200,
-            content=status
+            content=jsonable_encoder(status_data)
         )
             
     except Exception as e:
@@ -542,11 +725,11 @@ async def trigger_jira_sync(
         
         return JSONResponse(
             status_code=200 if success else 400,
-            content={
+            content=jsonable_encoder({
                 "success": success,
                 "message": message,
                 "sync_stats": sync_stats
-            }
+            })
         )
             
     except Exception as e:
@@ -567,10 +750,10 @@ async def get_all_jira_sync_statuses():
         
         return JSONResponse(
             status_code=200,
-            content={
+            content=jsonable_encoder({
                 "integrations": statuses,
                 "total_integrations": len(statuses)
-            }
+            })
         )
             
     except Exception as e:
