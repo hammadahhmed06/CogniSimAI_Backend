@@ -663,7 +663,7 @@ class JiraClient:
     
     # Sprint Management (for Agile projects)
     
-    def get_active_sprints(self, board_id: Union[str, int]) -> List[Dict[str, Any]]:
+    def get_active_sprints(self, board_id: Optional[Union[str, int]]) -> List[Dict[str, Any]]:
         """
         Get active sprints for a board.
         
@@ -681,9 +681,14 @@ class JiraClient:
             
             client = self.client
             assert client is not None
-            bid: Union[str, int] = board_id
-            if isinstance(board_id, str) and board_id.isdigit():
-                bid = int(board_id)
+            # Normalize board id to int when possible, otherwise to str
+            bid: Union[str, int]
+            if board_id is None:
+                bid = ''
+            elif isinstance(board_id, int):
+                bid = board_id
+            else:
+                bid = int(board_id) if str(board_id).isdigit() else str(board_id)
             sprints = client.sprints(bid, state='active')
             
             sprint_list = []
@@ -705,7 +710,7 @@ class JiraClient:
             logger.error(f"Failed to get active sprints for board {board_id}: {str(e)}")
             return []
     
-    def add_issues_to_sprint(self, sprint_id: Union[str, int], issue_keys: List[str]) -> Tuple[bool, str]:
+    def add_issues_to_sprint(self, sprint_id: Optional[Union[str, int]], issue_keys: List[str]) -> Tuple[bool, str]:
         """
         Add issues to a sprint.
         
@@ -726,10 +731,15 @@ class JiraClient:
             assert client is not None
             # Convert to int if possible for API expectations
             sid_int: int
+            # Normalize sprint id to int if possible; if not provided, raise
+            if sprint_id is None:
+                raise ValueError('Sprint ID is required')
             if isinstance(sprint_id, int):
                 sid_int = sprint_id
             else:
                 sid_int = int(sprint_id) if str(sprint_id).isdigit() else 0
+            if sid_int == 0:
+                raise ValueError(f'Invalid sprint id: {sprint_id}')
             client.add_issues_to_sprint(sid_int, issue_keys)
             logger.info(f"Successfully added {len(issue_keys)} issues to sprint {sprint_id}")
             return True, f"Added {len(issue_keys)} issues to sprint"
@@ -738,6 +748,304 @@ class JiraClient:
             error_msg = f"Failed to add issues to sprint: {str(e)}"
             logger.error(error_msg)
             return False, error_msg
+
+    def get_board_id_by_key(self, board_key: str) -> Optional[int]:
+        """
+        Get numeric board ID from board key/name.
+        
+        Args:
+            board_key: Board key or name (e.g., "KAN")
+            
+        Returns:
+            Numeric board ID if found, None otherwise
+        """
+        if not self._ensure_connected():
+            return None
+        
+        try:
+            # Try the REST API approach first
+            url = f"{self.jira_url}/rest/agile/1.0/board"
+            session = getattr(self.client, '_session', None)
+            if session and hasattr(session, 'get'):
+                response = session.get(url)
+                if response.status_code == 200:
+                    boards_data = response.json()
+                    for board in boards_data.get('values', []):
+                        if (board.get('name', '').upper() == str(board_key).upper() or 
+                            board.get('key', '').upper() == str(board_key).upper()):
+                            return int(board['id'])
+            
+            # Fallback to client method if available
+            if self.client and hasattr(self.client, 'boards'):
+                boards = self.client.boards()
+                for board in boards:
+                    if (hasattr(board, 'name') and str(board.name).upper() == str(board_key).upper()) or \
+                       (hasattr(board, 'key') and str(board.key).upper() == str(board_key).upper()):
+                        return int(board.id)
+        except Exception as e:
+            logger.warning(f"Could not retrieve board ID for '{board_key}': {str(e)}")
+        
+        return None
+
+    def list_available_boards(self) -> List[Dict[str, Any]]:
+        """
+        Get list of available boards for debugging.
+        
+        Returns:
+            List of board dictionaries with id, name, and key
+        """
+        if not self._ensure_connected():
+            return []
+        
+        boards = []
+        try:
+            # Try REST API first
+            url = f"{self.jira_url}/rest/agile/1.0/board"
+            session = getattr(self.client, '_session', None)
+            if session and hasattr(session, 'get'):
+                response = session.get(url)
+                if response.status_code == 200:
+                    boards_data = response.json()
+                    for board in boards_data.get('values', []):
+                        boards.append({
+                            'id': board.get('id'),
+                            'name': board.get('name'),
+                            'key': board.get('key', ''),
+                            'type': board.get('type', '')
+                        })
+                    return boards
+            
+            # Fallback to client method
+            if self.client and hasattr(self.client, 'boards'):
+                jira_boards = self.client.boards()
+                for board in jira_boards:
+                    boards.append({
+                        'id': getattr(board, 'id', ''),
+                        'name': getattr(board, 'name', ''),
+                        'key': getattr(board, 'key', ''),
+                        'type': getattr(board, 'type', '')
+                    })
+        except Exception as e:
+            logger.error(f"Error listing boards: {str(e)}")
+        
+        return boards
+
+    def create_sprint(self, board_id: Optional[Union[str, int]], name: str, start_date: Optional[str] = None, end_date: Optional[str] = None, goal: Optional[str] = None) -> Tuple[bool, str, Dict[str, Any]]:
+        """
+        Create a new sprint for a board using direct REST API call.
+        
+        Args:
+            board_id: Board ID (required)
+            name: Sprint name (required)
+            start_date: Sprint start date (ISO format, optional)
+            end_date: Sprint end date (ISO format, optional)
+            goal: Sprint goal (optional)
+            
+        Returns:
+            Tuple of (success: bool, message: str, sprint_data: Dict)
+        """
+        if not self._ensure_connected():
+            return False, "Not connected to Jira", {}
+        
+        try:
+            self._rate_limit()
+            
+            # Convert board_id to integer if possible
+            bid = None
+            if board_id is not None:
+                if isinstance(board_id, int):
+                    bid = board_id
+                elif str(board_id).isdigit():
+                    bid = int(board_id)
+                else:
+                    # For non-numeric board IDs like "KAN", we need to get the numeric board ID
+                    # Try to find the board by key/name using different API approaches
+                    try:
+                        if self.client:
+                            # Method 1: Try using the agile API to get boards
+                            try:
+                                url = f"{self.jira_url}/rest/agile/1.0/board"
+                                session = getattr(self.client, '_session', None)
+                                if session and hasattr(session, 'get'):
+                                    response = session.get(url)
+                                    if response.status_code == 200:
+                                        boards_data = response.json()
+                                        for board in boards_data.get('values', []):
+                                            board_name = board.get('name', '')
+                                            board_key = board.get('key', '')
+                                            
+                                            # Check multiple matching patterns
+                                            if (board_name.upper() == str(board_id).upper() or 
+                                                board_key.upper() == str(board_id).upper() or
+                                                board_name.upper().startswith(str(board_id).upper()) or
+                                                str(board_id).upper() in board_name.upper()):
+                                                bid = int(board['id'])
+                                                logger.info(f"Resolved board '{board_id}' to ID: {bid} (matched with '{board_name}')")
+                                                break
+                            except Exception as e:
+                                logger.debug(f"Method 1 failed: {e}")
+                            
+                            # Method 2: Try the client's boards method if available
+                            if bid is None:
+                                try:
+                                    boards = self.client.boards() if hasattr(self.client, 'boards') else []
+                                    for board in boards:
+                                        board_name = str(getattr(board, 'name', ''))
+                                        board_key = str(getattr(board, 'key', ''))
+                                        
+                                        # Check multiple matching patterns
+                                        if (board_name.upper() == str(board_id).upper() or
+                                            board_key.upper() == str(board_id).upper() or
+                                            board_name.upper().startswith(str(board_id).upper()) or
+                                            str(board_id).upper() in board_name.upper()):
+                                            bid = int(board.id)
+                                            logger.info(f"Resolved board '{board_id}' to ID: {bid} (via client, matched with '{board_name}')") 
+                                            break
+                                except Exception as e:
+                                    logger.debug(f"Method 2 failed: {e}")
+                            
+                            # Method 3: Try searching for the board by name in projects
+                            if bid is None:
+                                try:
+                                    projects = self.client.projects() if hasattr(self.client, 'projects') else []
+                                    for project in projects:
+                                        if (hasattr(project, 'key') and str(project.key).upper() == str(board_id).upper()) or \
+                                           (hasattr(project, 'name') and str(project.name).upper() == str(board_id).upper()):
+                                            # For project-based boards, often board ID = project ID or similar
+                                            # This is a fallback - try the project key as board identifier
+                                            logger.info(f"Found project '{project.key}' matching '{board_id}', trying as board identifier")
+                                            # We'll use the project key for now and let Jira handle it
+                                            bid = str(project.key)  # Keep as string for project-based boards
+                                            break
+                                except Exception as e:
+                                    logger.debug(f"Method 3 failed: {e}")
+                    except Exception as e:
+                        logger.warning(f"Board resolution failed: {e}")
+                    
+                    if bid is None:
+                        return False, f"Could not resolve board '{board_id}' to a board ID. Available resolution methods failed. Please check if the board exists and you have access to it.", {}
+            
+            if bid is None:
+                return False, "Board ID is required", {}
+            
+            # Ensure board ID is numeric as required by Jira API
+            try:
+                numeric_board_id = int(bid)
+            except (ValueError, TypeError):
+                return False, f"Board ID '{bid}' must be numeric", {}
+
+            # Check if the board supports sprints before attempting to create one
+            try:
+                board_details_url = f"{self.jira_url}/rest/agile/1.0/board/{numeric_board_id}"
+                session = getattr(self.client, '_session')
+                response = session.get(board_details_url)
+                if response.status_code == 200:
+                    board_data = response.json()
+                    board_type = board_data.get('type')
+                    board_name = board_data.get('name', f"Board {numeric_board_id}")
+                    logger.info(f"Verifying board type for '{board_name}' (ID: {numeric_board_id}). Type: {board_type}")
+                    if board_type != 'scrum':
+                        error_msg = f"Board '{board_name}' is a '{board_type}' board and does not support sprints. Please select a Scrum board."
+                        return False, error_msg, {}
+                else:
+                    logger.warning(f"Could not verify board type for board {numeric_board_id} (status: {response.status_code}). Proceeding with sprint creation attempt.")
+            except Exception as e:
+                logger.warning(f"An exception occurred while verifying board type for board {numeric_board_id}: {e}. Proceeding with sprint creation attempt.")
+            
+            # Create the exact payload Jira REST API expects
+            payload = {
+                "name": name,
+                "originBoardId": numeric_board_id  # Must be numeric integer
+            }
+            
+            # Add optional fields only if they have valid values
+            if start_date and start_date.strip():
+                # Ensure proper ISO 8601 format with timezone
+                try:
+                    from datetime import datetime
+                    # Parse and reformat to ensure proper timezone
+                    if 'T' not in start_date:
+                        start_date = f"{start_date}T00:00:00.000Z"
+                    elif not start_date.endswith('Z') and '+' not in start_date:
+                        start_date = f"{start_date}.000Z" if '.' not in start_date else f"{start_date}Z"
+                    payload["startDate"] = start_date
+                except Exception as e:
+                    logger.warning(f"Invalid start date format: {start_date}, error: {e}")
+            
+            if end_date and end_date.strip():
+                # Ensure proper ISO 8601 format with timezone
+                try:
+                    if 'T' not in end_date:
+                        end_date = f"{end_date}T23:59:59.999Z"
+                    elif not end_date.endswith('Z') and '+' not in end_date:
+                        end_date = f"{end_date}.999Z" if '.' not in end_date else f"{end_date}Z"
+                    payload["endDate"] = end_date
+                except Exception as e:
+                    logger.warning(f"Invalid end date format: {end_date}, error: {e}")
+            
+            if goal and goal.strip():
+                payload["goal"] = goal.strip()
+            
+            # Make direct REST API call using the authenticated session
+            url = f"{self.jira_url}/rest/agile/1.0/sprint"
+            
+            logger.info(f"Creating sprint '{name}' on board ID {numeric_board_id} via REST API")
+            logger.info(f"Sprint creation payload: {payload}")
+            
+            # Use the authenticated session from the JIRA client
+            if not self.client:
+                return False, "Client not connected", {}
+                
+            if not hasattr(self.client, '_session'):
+                return False, "Client session not available", {}
+                
+            session = getattr(self.client, '_session', None)
+            if not session or not hasattr(session, 'post'):
+                return False, "Invalid client session", {}
+                
+            response = session.post(url, json=payload)
+            
+            logger.info(f"Sprint creation response status: {response.status_code}")
+            logger.info(f"Sprint creation response headers: {dict(response.headers)}")
+            logger.info(f"Sprint creation response body: {response.text}")
+            
+            if response.status_code in (200, 201):
+                result = response.json()
+                sprint_data = {
+                    'id': result.get('id', ''),
+                    'name': result.get('name', name),
+                    'state': result.get('state', 'future'),
+                    'startDate': result.get('startDate', ''),
+                    'endDate': result.get('endDate', ''),
+                    'goal': result.get('goal', ''),
+                    'originBoardId': result.get('originBoardId', numeric_board_id)
+                }
+                
+                logger.info(f"Successfully created sprint '{name}' (ID: {result.get('id', 'unknown')})")
+                return True, f"Created sprint: {name}", sprint_data
+            else:
+                error_text = response.text
+                logger.error(f"Sprint creation failed - Status: {response.status_code}")
+                logger.error(f"Sprint creation failed - Request URL: {url}")
+                logger.error(f"Sprint creation failed - Request payload: {payload}")
+                logger.error(f"Sprint creation failed - Response: {error_text}")
+                
+                try:
+                    error_data = response.json()
+                    error_messages = error_data.get('errorMessages', [])
+                    if error_messages:
+                        error_text = '; '.join(error_messages)
+                except:
+                    pass
+                
+                error_msg = f"HTTP {response.status_code}: {error_text}"
+                logger.error(f"Failed to create sprint: {error_msg}")
+                return False, error_msg, {}
+                
+        except Exception as e:
+            error_msg = f"Error creating sprint: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg, {}
     
     # Bulk Operations
     

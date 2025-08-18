@@ -60,7 +60,11 @@ def get_workspace_id_from_user(current_user: UserModel = Depends(get_current_use
 
 def get_jira_sync_service() -> JiraSyncService:
     """Dependency to get JiraSyncService instance."""
-    return JiraSyncService(supabase)
+    # Return the already-imported global sync_service so all endpoints share the same
+    # in-memory Jira clients registry. Creating a new JiraSyncService per request
+    # caused empty clients dicts and 404 "Integration not found" responses for
+    # endpoints (e.g., create sprint) that relied on the dependency.
+    return sync_service
 
 
 class TransitionRequest(BaseModel):
@@ -762,3 +766,302 @@ async def get_all_jira_sync_statuses():
             status_code=500,
             content={"error": f"Failed to get sync statuses: {str(e)}"}
         )
+
+
+# Board Management Endpoints
+
+@router.get("/jira/{integration_id}/boards")
+async def list_boards(
+    integration_id: str,
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    List all available boards for debugging and board resolution.
+    """
+    try:
+        logger.info(f"Listing boards for integration: {integration_id}")
+        
+        # Get workspace ID from user
+        workspace_id = get_workspace_id_from_user(current_user)
+        
+        # Get Jira client for this integration
+        try:
+            jira_client = sync_service.clients.get(integration_id)
+            if not jira_client:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": "Integration not found or not connected"}
+                )
+            
+            # Get available boards
+            boards = jira_client.list_available_boards()
+            
+            logger.info(f"Found {len(boards)} boards")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "boards": boards,
+                    "count": len(boards)
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error accessing Jira service: {str(e)}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Failed to access Jira service: {str(e)}"}
+            )
+            
+    except Exception as e:
+        logger.error(f"Error listing boards: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to list boards: {str(e)}"}
+        )
+
+
+# Sprint Management Endpoints
+
+@router.get("/jira/{integration_id}/boards/{board_id}/sprints")
+async def get_board_sprints(
+    integration_id: str,
+    board_id: str,
+    state: str = Query("active", description="Sprint state: active, future, closed, or all")
+):
+    """
+    Get sprints for a board.
+    """
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Integration not found"}
+            )
+        
+        if not client:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Jira client not available"}
+            )
+        
+        # board_id is a path parameter and should always be a string
+        bid = board_id
+        if state == "active":
+            sprints = client.get_active_sprints(bid)
+        else:
+            # For future enhancement - could implement other states
+            sprints = client.get_active_sprints(bid)
+        
+        return JSONResponse(
+            status_code=200,
+            content=jsonable_encoder({
+                "sprints": sprints,
+                "board_id": board_id,
+                "state": state
+            })
+        )
+            
+    except Exception as e:
+        logger.error(f"Error getting board sprints: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to get sprints: {str(e)}"}
+        )
+
+
+@router.post("/jira/{integration_id}/sprints/{sprint_id}/issues")
+async def add_issues_to_sprint(
+    integration_id: str,
+    sprint_id: str,
+    request: Request
+):
+    """
+    Add issues to a sprint.
+    """
+    try:
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Integration not found"}
+            )
+        
+        if not client:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Jira client not available"}
+            )
+        
+        body = await request.json()
+        issue_keys = body.get("issue_keys", [])
+        
+        if not issue_keys:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No issue keys provided"}
+            )
+        
+        success, message = client.add_issues_to_sprint(sprint_id, issue_keys)
+        
+        return JSONResponse(
+            status_code=200 if success else 400,
+            content=jsonable_encoder({
+                "success": success,
+                "message": message,
+                "sprint_id": sprint_id,
+                "issue_keys": issue_keys
+            })
+        )
+            
+    except Exception as e:
+        logger.error(f"Error adding issues to sprint: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to add issues to sprint: {str(e)}"}
+        )
+
+
+@router.post("/jira/{integration_id}/boards/{board_id}/sprints")
+async def create_sprint(
+    integration_id: str,
+    board_id: str,
+    request: Request
+):
+    """
+    Create a new sprint for a board.
+    
+    Expected JSON payload:
+    {
+        "name": "Sprint Name (required)",
+        "goal": "Sprint goal (optional)", 
+        "startDate": "2024-01-01T00:00:00.000Z (optional, ISO format)",
+        "endDate": "2024-01-14T23:59:59.000Z (optional, ISO format)"
+    }
+    """
+    try:
+        # Use the global sync_service instead of dependency injection to avoid empty clients dict
+        client = sync_service.clients.get(integration_id)
+        if not client:
+            logger.error(f"Integration {integration_id} not found in sync_service.clients: {list(sync_service.clients.keys())}")
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Integration not found or not connected. Please connect to Jira first."}
+            )
+        
+        # Validate client connection
+        if not client.is_connected:
+            logger.warning(f"Client for integration {integration_id} is not connected. Attempting reconnection...")
+            success, message = client.connect()
+            if not success:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": f"Jira connection failed: {message}"}
+                )
+        
+        # Parse and validate request body
+        try:
+            body = await request.json()
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid JSON in request body: {str(e)}"}
+            )
+        
+        name = body.get('name', '').strip()
+        goal = body.get('goal', '').strip()
+        start_date = body.get('startDate', '').strip()
+        end_date = body.get('endDate', '').strip()
+        
+        # Validate required fields
+        if not name:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Sprint name is required and cannot be empty"}
+            )
+        
+        # Validate board_id is not empty
+        if not board_id or board_id.strip() == '':
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Board ID is required and cannot be empty"}
+            )
+        
+        # If board_id is not numeric, try to get the numeric board ID
+        resolved_board_id = board_id
+        if not board_id.isdigit():
+            numeric_board_id = client.get_board_id_by_key(board_id)
+            if numeric_board_id:
+                resolved_board_id = str(numeric_board_id)
+                logger.info(f"Resolved board '{board_id}' to numeric ID: {numeric_board_id}")
+            else:
+                logger.warning(f"Could not resolve board '{board_id}' to numeric ID, trying as-is")
+        
+        logger.info(f"Creating sprint '{name}' on board '{board_id}' (resolved: '{resolved_board_id}') for integration {integration_id}")
+        logger.debug(f"Sprint payload: name='{name}', goal='{goal}', start_date='{start_date}', end_date='{end_date}'")
+        
+        # Create sprint using client with proper error handling
+        success, message, sprint_data = client.create_sprint(
+            board_id=resolved_board_id,
+            name=name,
+            start_date=start_date if start_date else None,
+            end_date=end_date if end_date else None,
+            goal=goal if goal else None
+        )
+        
+        if success:
+            logger.info(f"Successfully created sprint: {message}")
+            return JSONResponse(
+                status_code=201,
+                content=jsonable_encoder({
+                    "success": True,
+                    "message": message,
+                    "sprint": sprint_data,
+                    "integration_id": integration_id,
+                    "board_id": board_id,
+                    "resolved_board_id": resolved_board_id
+                })
+            )
+        else:
+            logger.error(f"Failed to create sprint: {message}")
+            return JSONResponse(
+                status_code=400,
+                content=jsonable_encoder({
+                    "success": False,
+                    "error": message,
+                    "integration_id": integration_id,
+                    "board_id": board_id,
+                    "resolved_board_id": resolved_board_id
+                })
+            )
+            
+    except Exception as e:
+        error_msg = f"Unexpected error creating sprint: {str(e)}"
+        logger.error(error_msg)
+        return JSONResponse(
+            status_code=500,
+            content={"error": error_msg, "integration_id": integration_id, "board_id": board_id}
+        )
+
+
+@router.get("/jira/{integration_id}/sync/logs")
+async def get_jira_sync_logs(integration_id: str):
+    """Return basic sync status and placeholder logs for a Jira integration.
+    This implements the missing /sync/logs endpoint that the frontend is calling.
+    """
+    try:
+        status = sync_service.get_sync_status(integration_id)
+        if status.get("status") == "not_found":
+            return JSONResponse(status_code=404, content={"error": "Integration not found"})
+        # Placeholder: real log collection not yet implemented.
+        return JSONResponse(
+            status_code=200,
+            content=jsonable_encoder({
+                "integration_id": integration_id,
+                "status": status,
+                "logs": []
+            })
+        )
+    except Exception as e:
+        logger.error(f"Error getting sync logs: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": f"Failed to get sync logs: {str(e)}"})

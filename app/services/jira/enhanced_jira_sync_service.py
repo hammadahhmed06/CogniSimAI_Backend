@@ -385,7 +385,9 @@ class EnhancedJiraSyncService:
         
         try:
             client = self.clients[integration_id]
-            return client.search_issues_jql(jql, max_results)
+            search_result = client.search_issues_jql(jql, max_results)
+            # Extract issues from the search result dictionary
+            return search_result.get('issues', []) if isinstance(search_result, dict) else []
             
         except Exception as e:
             logger.error(f"Error searching issues: {str(e)}")
