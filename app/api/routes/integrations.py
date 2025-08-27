@@ -26,36 +26,69 @@ logger = logging.getLogger("cognisim_ai")
 router = APIRouter(prefix="/api/integrations", tags=["integrations"])
 
 
-def get_workspace_id_from_user(current_user: UserModel = Depends(get_current_user)) -> str:
+def get_workspace_id_from_user(request: Request, current_user: UserModel = Depends(get_current_user)) -> str:
+    """Resolve active workspace for current user.
+
+    Order of resolution:
+    1. X-Workspace-Id header (validate membership)
+    2. First workspace the user is a member of (membership table / RPC)
+    3. 404 if none
     """
-    Get workspace ID for current user.
-    """
+    user_id = str(current_user.id)
+    header_wid = request.headers.get("X-Workspace-Id")
+
+    # Helper to validate membership
+    def _validate(wid: str) -> bool:
+        try:
+            res = (
+                supabase.table("workspace_members")
+                .select("id")
+                .eq("workspace_id", wid)
+                .eq("user_id", user_id)
+                .eq("status", "active")
+                .limit(1)
+                .execute()
+            )
+            return bool(getattr(res, "data", []) )
+        except Exception as e:
+            logger.warning(f"Membership validation error for user {user_id} workspace {wid}: {e}")
+            return False
+
+    # 1. Header provided
+    if header_wid and _validate(header_wid):
+        return header_wid
+    if header_wid and not _validate(header_wid):
+        logger.warning(f"User {user_id} attempted access to non-member workspace {header_wid}")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a member of workspace")
+
+    # 2. Fallback to first membership (RPC preferred)
     try:
-        user_id = str(current_user.id)
-        
-        # Try to find existing workspace for user via team_members -> teams -> workspace_id
-        user_teams = supabase.table("team_members").select("team_id").eq("user_id", user_id).limit(1).execute()
-        
-        if user_teams.data:
-            team_id = str(user_teams.data[0]['team_id'])
-            # Get the workspace_id from the team
-            team_info = supabase.table("teams").select("workspace_id").eq("id", team_id).execute()
-            if team_info.data:
-                workspace_id = str(team_info.data[0]['workspace_id'])
-                logger.info(f"Found workspace {workspace_id} for user {user_id} via team {team_id}")
-                return workspace_id
-        
-        # Use the correct CogniSim Corp workspace ID
-        existing_workspace_id = "84e53826-b670-41fa-96d3-211ebdbc080c"
-        logger.info(f"Using CogniSim Corp workspace: {existing_workspace_id}")
-        return existing_workspace_id
-        
+        try:
+            rpc_res = supabase.rpc("list_user_workspaces", {"p_user_id": user_id}).execute()
+            rows = getattr(rpc_res, "data", []) or []
+        except Exception:
+            rows = []
+        wid = rows[0]["id"] if rows else None
+        if not wid:
+            # Manual fallback join
+            join_res = (
+                supabase.table("workspace_members")
+                .select("workspace_id")
+                .eq("user_id", user_id)
+                .eq("status", "active")
+                .limit(1)
+                .execute()
+            )
+            data = getattr(join_res, "data", []) or []
+            wid = data[0]["workspace_id"] if data else None
+        if not wid:
+            raise HTTPException(status_code=404, detail="User has no workspaces")
+        return str(wid)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to get workspace for user {current_user.id}: {str(e)}")
-        # Fallback to the correct CogniSim Corp workspace
-        fallback_workspace_id = "84e53826-b670-41fa-96d3-211ebdbc080c"
-        logger.info(f"Using fallback workspace: {fallback_workspace_id}")
-        return fallback_workspace_id
+        logger.error(f"Workspace resolution failed for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to resolve workspace")
 
 
 def get_jira_sync_service() -> JiraSyncService:
@@ -780,9 +813,6 @@ async def list_boards(
     """
     try:
         logger.info(f"Listing boards for integration: {integration_id}")
-        
-        # Get workspace ID from user
-        workspace_id = get_workspace_id_from_user(current_user)
         
         # Get Jira client for this integration
         try:
