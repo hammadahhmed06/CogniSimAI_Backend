@@ -12,6 +12,7 @@ from app.services.feature_flags import load_feature_flags, feature_enabled # Imp
 from fastapi.responses import Response
 from app.api.routes.integrations import router as integrations_router
 from app.api.routes.projects import router as projects_router
+from app.api.routes.issues import router as issues_router
 from app.api.routes.workspaces import router as workspaces_router
 from app.core.dependencies import get_current_user, UserModel, supabase, limiter, ErrorResponse, require_role
 # --- 1. Initial Configuration & Setup ---
@@ -121,3 +122,4 @@ async def get_epic_suggestions(request: Request, current_user: UserModel = Depen
 app.include_router(integrations_router)
 app.include_router(projects_router)
 app.include_router(workspaces_router)
+app.include_router(issues_router)
