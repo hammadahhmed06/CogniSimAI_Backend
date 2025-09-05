@@ -66,11 +66,12 @@ class ItemUpdate(BaseModel):
 class Item(BaseModel):
     id: UUID
     project_id: UUID
-    item_key: str
+    issue_key: str
     title: str
     status: str
     priority: Optional[str]
     sprint_id: Optional[UUID] = None
+    backlog_rank: Optional[int] = None
 
 class SprintCreate(BaseModel):
     name: str = Field(..., min_length=1)
@@ -93,15 +94,16 @@ class AssignItems(BaseModel):
 def _normalize_key(key: str) -> str:
     return key.upper().replace(" ", "_")[:12]
 
-def _item_from_row(row: dict) -> Item:
+def _item_from_issue_row(row: dict) -> Item:
     return Item(
         id=row["id"],
-        project_id=row["project_id"],
-        item_key=row["item_key"],
-        title=row["title"],
-        status=row["status"],
+        project_id=row.get("project_id") or UUID(int=0),
+        issue_key=row.get("issue_key") or "ISS-UNKNOWN",
+        title=row.get("title") or "Untitled",
+        status=row.get("status") or "todo",
         priority=row.get("priority"),
         sprint_id=row.get("sprint_id"),
+        backlog_rank=row.get("backlog_rank"),
     )
 
 def _sprint_from_row(row: dict) -> Sprint:
@@ -445,12 +447,10 @@ def list_items(project_id: UUID, current_user: UserModel = Depends(get_current_u
     proj = supabase.table("projects").select("id").eq("id", str(project_id)).eq("owner_id", str(current_user.id)).maybe_single().execute()
     if not getattr(proj, "data", None):
         raise HTTPException(status_code=404, detail="Project not found")
-    try:
-        res = supabase.table("items").select("id,project_id,item_key,title,status,priority,sprint_id,backlog_rank").eq("project_id", str(project_id)).order("backlog_rank", desc=False).order("created_at", desc=False).execute()
-    except APIError as e:
-        # fallback if backlog_rank missing
-        res = supabase.table("items").select("id,project_id,item_key,title,status,priority,sprint_id").eq("project_id", str(project_id)).order("created_at", desc=True).execute()
-    return [_item_from_row(r) for r in (getattr(res, "data", []) or [])]
+    # Unified backlog: read from issues
+    fields = "id,project_id,issue_key,title,status,priority,sprint_id,backlog_rank"
+    res = supabase.table("issues").select(fields).eq("project_id", str(project_id)).order("backlog_rank", desc=False).order("created_at", desc=False).execute()
+    return [_item_from_issue_row(r) for r in (getattr(res, "data", []) or [])]
 
 @router.post("/{project_id}/items", response_model=Item, status_code=status.HTTP_201_CREATED)
 def create_item(project_id: UUID, body: ItemCreate, current_user: UserModel = Depends(get_current_user)):
@@ -458,45 +458,48 @@ def create_item(project_id: UUID, body: ItemCreate, current_user: UserModel = De
     proj_data = getattr(proj, "data", None)
     if not proj_data:
         raise HTTPException(status_code=404, detail="Project not found")
-    count_res = supabase.table("items").select("id").eq("project_id", str(project_id)).execute()
-    seq = (len(getattr(count_res, "data", []) or []) + 1)
+    count_res = supabase.table("issues").select("id").eq("project_id", str(project_id)).execute()
+    seq = (len(getattr(count_res, 'data', []) or []) + 1)
     issue_key = f"{proj_data['key']}-{seq}"
-    # Compute next backlog_rank if column exists
-    backlog_rank_val = None
+    backlog_rank_val = 1
     try:
-        max_res = supabase.table("items").select("backlog_rank").eq("project_id", str(project_id)).order("backlog_rank", desc=True).limit(1).execute()
+        max_res = supabase.table("issues").select("backlog_rank").eq("project_id", str(project_id)).order("backlog_rank", desc=True).limit(1).execute()
         max_data = getattr(max_res, 'data', []) or []
         if max_data and max_data[0].get('backlog_rank') is not None:
             backlog_rank_val = (max_data[0].get('backlog_rank') or 0) + 1
-        else:
-            backlog_rank_val = 1
-    except Exception:
-        backlog_rank_val = None
-    insert_payload = {"id": str(uuid4()), "project_id": str(project_id), "item_key": issue_key, "title": body.title.strip() or issue_key, "status": body.status, "priority": body.priority}
-    if backlog_rank_val is not None:
-        insert_payload['backlog_rank'] = backlog_rank_val
-    ins = supabase.table("items").insert(insert_payload).execute()
-    data = getattr(ins, "data", None)
-    if not data:
-        raise HTTPException(status_code=500, detail="Failed to create item")
-    try:  # best-effort activity log
-        _log_project_activity(project_id, current_user.id, "item_create", {"item_key": issue_key, "title": insert_payload["title"], "status": insert_payload["status"]})
     except Exception:
         pass
-    return _item_from_row(data[0])
+    insert_payload = {
+        "id": str(uuid4()),
+        "project_id": str(project_id),
+        "issue_key": issue_key,
+        "title": body.title.strip() or issue_key,
+        "status": body.status,
+        "priority": body.priority,
+        "owner_id": str(current_user.id),
+        "backlog_rank": backlog_rank_val
+    }
+    try:
+        supabase.table("issues").insert(insert_payload).execute()
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to create issue")
+    try:
+        _log_project_activity(project_id, current_user.id, "item_create", {"issue_key": issue_key, "title": insert_payload["title"], "status": insert_payload["status"]})
+    except Exception:
+        pass
+    return _item_from_issue_row(insert_payload)
 
 @router.patch("/{project_id}/items/{item_id}", response_model=Item)
 def update_item(project_id: UUID, item_id: UUID, body: ItemUpdate, current_user: UserModel = Depends(get_current_user)):
     proj = supabase.table("projects").select("id").eq("id", str(project_id)).eq("owner_id", str(current_user.id)).maybe_single().execute()
     if not getattr(proj, "data", None):
         raise HTTPException(status_code=404, detail="Project not found")
-    # Fetch existing for diff (best-effort)
-    prev_res = supabase.table("items").select("id,status,title,item_key,priority,sprint_id").eq("id", str(item_id)).eq("project_id", str(project_id)).maybe_single().execute()
+    prev_res = supabase.table("issues").select("id,status,title,issue_key,priority,sprint_id,backlog_rank").eq("id", str(item_id)).eq("project_id", str(project_id)).maybe_single().execute()
     prev = getattr(prev_res, "data", None)
     update_dict = {k: v for k, v in body.dict(exclude_unset=True).items() if v is not None}
     if not update_dict:
         raise HTTPException(status_code=400, detail="No fields to update")
-    upd = supabase.table("items").update(update_dict).eq("id", str(item_id)).eq("project_id", str(project_id)).execute()
+    upd = supabase.table("issues").update(update_dict).eq("id", str(item_id)).eq("project_id", str(project_id)).execute()
     data = getattr(upd, "data", None)
     if not data:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -505,16 +508,16 @@ def update_item(project_id: UUID, item_id: UUID, body: ItemUpdate, current_user:
     try:
         changes = {}
         if prev:
-            for field in ["title", "status", "priority", "sprint_id"]:
+            for field in ["title", "status", "priority", "sprint_id", "backlog_rank"]:
                 old_v = prev.get(field) if isinstance(prev, dict) else None
                 new_v = row.get(field)
                 if old_v != new_v:
                     changes[field] = {"from": old_v, "to": new_v}
         if changes:
-            _log_project_activity(project_id, current_user.id, "item_update", {"item_key": row.get("item_key"), **changes})
+            _log_project_activity(project_id, current_user.id, "item_update", {"issue_key": row.get("issue_key"), **changes})
     except Exception:
         pass
-    return _item_from_row(row)
+    return _item_from_issue_row(row)
 
 class ItemsReorderPayload(BaseModel):
     item_ids: List[UUID]
@@ -531,7 +534,7 @@ def reorder_items(project_id: UUID, payload: ItemsReorderPayload, current_user: 
         for idx, iid in enumerate(payload.item_ids):
             updates.append({"id": str(iid), "backlog_rank": idx + 1})
         if updates:
-            supabase.table("items").upsert(updates).execute()
+            supabase.table("issues").upsert(updates).execute()
     except APIError as e:
         if 'backlog_rank' in str(e):
             # Column missing; ignore silently
@@ -547,7 +550,7 @@ def project_stats(project_id: UUID, current_user: UserModel = Depends(get_curren
     if not getattr(proj, 'data', None):
         raise HTTPException(status_code=404, detail="Project not found")
     try:
-        res = supabase.table("items").select("status").eq("project_id", str(project_id)).execute()
+        res = supabase.table("issues").select("status").eq("project_id", str(project_id)).execute()
         rows = getattr(res, 'data', []) or []
     except Exception:
         rows = []

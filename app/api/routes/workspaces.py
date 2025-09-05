@@ -4,7 +4,7 @@ from typing import List, Optional, Any
 from uuid import UUID, uuid4
 import re
 import logging
-from app.core.dependencies import supabase, get_current_user, UserModel
+from app.core.dependencies import supabase, get_current_user, UserModel, get_workspace_member
 
 logger = logging.getLogger("cognisim_ai")
 
@@ -47,6 +47,7 @@ class WorkspaceDetail(Workspace):
     members_count: int
     # Placeholder for future stats (projects_count, integrations_count, etc.)
     # Add fields as needed
+    settings: Optional[dict] = None
 
 class WorkspaceActivityEvent(BaseModel):
     id: UUID
@@ -346,8 +347,62 @@ def get_workspace_detail(workspace_id: UUID, current_user: UserModel = Depends(g
     except Exception as e:
         logger.debug(f"Member count failed for workspace {workspace_id}: {e}")
 
+    # Settings fetch
+    settings_obj: Optional[dict] = None
+    try:
+        st_res = supabase.table("workspace_settings").select("estimation_scale,default_sprint_length,timezone").eq("workspace_id", str(workspace_id)).limit(1).execute()
+        st_rows = getattr(st_res, 'data', []) or []
+        if st_rows:
+            settings_obj = st_rows[0]
+    except Exception:
+        pass
     base = _workspace_from_row(ws_rows[0])
-    return WorkspaceDetail(**base.dict(), members_count=members_count)
+    return WorkspaceDetail(**base.dict(), members_count=members_count, settings=settings_obj)
+
+class WorkspaceSettingsUpdate(BaseModel):
+    estimation_scale: Optional[str] = Field(None, max_length=32)
+    default_sprint_length: Optional[int] = Field(None, ge=1, le=60)
+    timezone: Optional[str] = Field(None, max_length=64)
+
+@router.patch("/{workspace_id}/settings", status_code=status.HTTP_204_NO_CONTENT)
+def update_workspace_settings(workspace_id: UUID, body: WorkspaceSettingsUpdate, current_user: UserModel = Depends(get_current_user)):
+    _require_workspace_member(str(workspace_id), str(current_user.id), ["owner", "admin"])
+    updates: dict[str, Any] = {}
+    for field in ["estimation_scale", "default_sprint_length", "timezone"]:
+        val = getattr(body, field)
+        if val is not None:
+            updates[field] = val
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+    try:
+        # Upsert style: attempt update; if no row insert
+        existing = supabase.table("workspace_settings").select("workspace_id").eq("workspace_id", str(workspace_id)).limit(1).execute()
+        rows = getattr(existing, 'data', []) or []
+        if rows:
+            supabase.table("workspace_settings").update(updates).eq("workspace_id", str(workspace_id)).execute()
+        else:
+            supabase.table("workspace_settings").insert({"workspace_id": str(workspace_id), **updates}).execute()
+        _log_activity(str(workspace_id), str(current_user.id), "workspace_settings_updated", {"fields": list(updates.keys())})
+    except Exception as e:
+        logger.error(f"Settings update failed for workspace {workspace_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update settings")
+    return None
+
+class WorkspaceSwitchBody(BaseModel):
+    workspace_id: UUID
+
+@router.post("/switch", response_model=Workspace)
+def switch_workspace(body: WorkspaceSwitchBody, current_user: UserModel = Depends(get_current_user)):
+    """Validate membership and return workspace (client can persist id locally)."""
+    ws_id = str(body.workspace_id)
+    _require_workspace_member(ws_id, str(current_user.id))
+    ws_res = supabase.table("workspaces").select("id,name,description,slug,plan").eq("id", ws_id).limit(1).execute()
+    rows = getattr(ws_res, 'data', []) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    row = rows[0]
+    row['member_role'] = _require_workspace_member(ws_id, str(current_user.id)).get('role')
+    return _workspace_from_row(row)
 
 
 @router.patch("/{workspace_id}", response_model=Workspace)

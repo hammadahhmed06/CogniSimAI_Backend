@@ -75,3 +75,50 @@ def require_role(required_roles: list[str]):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     # Return the dependency correctly
     return Depends(role_checker)
+
+# Workspace RBAC helpers
+class WorkspaceContext(BaseModel):
+    workspace_id: UUID
+    role: str
+
+async def get_workspace_member(workspace_id: UUID, current_user: UserModel = Depends(get_current_user)) -> WorkspaceContext:
+    try:
+        res = supabase.table("workspace_members").select("role,status").eq("workspace_id", str(workspace_id)).eq("user_id", str(current_user.id)).limit(1).execute()
+        rows = getattr(res, 'data', []) or []
+        if not rows:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a workspace member")
+        r = rows[0]
+        if r.get('status') != 'active':
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Membership inactive")
+        return WorkspaceContext(workspace_id=workspace_id, role=r.get('role') or 'member')
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Workspace membership lookup failed: {e}")
+        raise HTTPException(status_code=500, detail="Workspace membership validation failed")
+
+def workspace_role_required(*allowed: str):
+    async def checker(ctx: WorkspaceContext = Depends(get_workspace_member)):
+        if allowed and ctx.role not in allowed:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
+        return ctx
+    return checker
+
+def enforce_workspace_scoped_query(table: str, field: str = "workspace_id"):
+    """Factory returning a helper to assert a record belongs to a workspace before proceeding."""
+    async def validator(record_id: UUID, ctx: WorkspaceContext = Depends(get_workspace_member)):
+        try:
+            res = supabase.table(table).select(f"id,{field}").eq("id", str(record_id)).limit(1).execute()
+            rows = getattr(res, 'data', []) or []
+            if not rows:
+                raise HTTPException(status_code=404, detail="Resource not found")
+            row = rows[0]
+            if str(row.get(field)) != str(ctx.workspace_id):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-workspace access denied")
+            return row
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Workspace scope validation failed: {e}")
+            raise HTTPException(status_code=500, detail="Workspace scope validation failed")
+    return validator
