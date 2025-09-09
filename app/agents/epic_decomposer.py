@@ -23,12 +23,23 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv, find_dotenv
 
 from openai import AsyncOpenAI  # Official OpenAI client (used with Gemini-compatible base_url)
-from agents import Agent, Runner,OpenAIChatCompletionsModel  # Core SDK primitives
+from agents import Agent, Runner, OpenAIChatCompletionsModel  # Core SDK primitives
+try:
+    # Optional Tool interface (future: QuadRails style tools) – kept loose to not break if version lacks it.
+    from agents import Tool  # type: ignore
+except Exception:  # pragma: no cover
+    class Tool:  # type: ignore
+        pass
+
+try:
+    from app.core.dependencies import supabase  # reuse existing supabase client
+except Exception:  # pragma: no cover
+    supabase = None  # type: ignore
 # Explicit model import (doc-aligned)
 
 
@@ -48,10 +59,12 @@ client = AsyncOpenAI(
 )
 
 
-EPIC_INSTRUCTIONS = (
-    "You are an Epic Decomposition Assistant. Return ONLY valid JSON with keys: "
-    "epic (string), stories (array of objects with title and acceptance_criteria[]). "
-    "3-8 distinct stories, concise titles (<= 12 words), each with 2-6 clear acceptance criteria."
+BASE_INSTRUCTIONS = (
+    "You are an Epic Decomposition Assistant. You will receive an EPIC_CONTEXT section. "
+    "Generate user stories ONLY for scope actually described there. Avoid duplication of existing child stories. "
+    "Return STRICT JSON: {\\n  epic: string,\\n  stories: [ { title: string, acceptance_criteria: string[] } ]\\n}. "
+    "Titles: concise (<= 12 words), distinct, user-value oriented. Acceptance criteria: 2-6 bullet-quality statements phrased as observable outcomes (no future tense, no vague words like 'should work'). "
+    "No markdown, no explanations outside JSON."
 )
 
 
@@ -66,7 +79,49 @@ def _safe_parse_json(raw: str) -> Dict[str, Any] | None:
         return None
 
 
-async def decompose_epic(epic_description: str) -> Dict[str, Any]:
+def _fetch_existing_children(epic_id: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Fetch existing child issues (tasks/stories) and sibling epics for context (best effort)."""
+    if not supabase:
+        return [], []
+    try:
+        children_res = supabase.table("issues").select("id,title,type,acceptance_criteria").eq("epic_id", epic_id).execute()
+        children = getattr(children_res, 'data', []) or []
+    except Exception:
+        children = []
+    try:
+        # simple sibling fetch: other stories without epic link but same epic's project could be noise; skip for now
+        siblings: List[Dict[str, Any]] = []
+    except Exception:
+        siblings = []
+    return children, siblings
+
+
+def _summarize_children(children: List[Dict[str, Any]]) -> str:
+    if not children:
+        return "(none)"
+    out = []
+    for c in children[:15]:  # cap to avoid prompt bloat
+        raw_title = c.get('title') or ''
+        title_snip = raw_title[:120]
+        ac = c.get('acceptance_criteria') or []
+        ac_items: List[str] = []
+        if isinstance(ac, list):
+            for a in ac[:3]:
+                if isinstance(a, dict):
+                    txt = a.get('text') or ''
+                else:
+                    txt = str(a) if a is not None else ''
+                txt = txt.strip()
+                if txt:
+                    ac_items.append(txt[:120])
+        ac_preview = "; ".join(ac_items)
+        if len(ac_preview) > 160:
+            ac_preview = ac_preview[:157] + '...'
+        out.append(f"- {title_snip} | criteria: {ac_preview}")
+    return "\n".join(out)
+
+
+async def decompose_epic(epic_description: str, max_stories: int = 6, epic_id: str | None = None) -> Dict[str, Any]:
     """Run the agent to decompose an epic and return structured JSON.
 
     Returns a dict with keys:
@@ -83,16 +138,37 @@ async def decompose_epic(epic_description: str) -> Dict[str, Any]:
             "error": "GEMINI_API_KEY not configured",
         }
 
+    # Bound max stories (3..12)
+    if max_stories < 3:
+        max_stories = 3
+    if max_stories > 12:
+        max_stories = 12
+
+    existing_children: List[Dict[str, Any]] = []
+    if epic_id:
+        existing_children, _ = _fetch_existing_children(epic_id)
+    children_summary = _summarize_children(existing_children)
+
+    dynamic_instructions = (
+        f"{BASE_INSTRUCTIONS}\n" \
+        f"Required story count: up to {max_stories} stories (fewer allowed if scope is small). Do NOT exceed {max_stories}. "
+        f"If functionality already represented in EXISTING_CHILD_STORIES skip it."
+    )
+
     agent = Agent(
         name="EpicDecomposer",
-        instructions=EPIC_INSTRUCTIONS,
+        instructions=dynamic_instructions,
         model=OpenAIChatCompletionsModel(
             model="gemini-2.0-flash",
             openai_client=client,
         ),
     )
 
-    user_prompt = f"Decompose this epic:\n{epic_description}".strip()
+    user_prompt = (
+        "EPIC_CONTEXT:\n" + epic_description + "\n\n" +
+        "EXISTING_CHILD_STORIES:\n" + children_summary + "\n\n" +
+        "Respond with JSON now."
+    )
 
     try:
         result = await Runner.run(agent, user_prompt)
@@ -106,6 +182,22 @@ async def decompose_epic(epic_description: str) -> Dict[str, Any]:
 
     raw_text = getattr(result, "final_output", str(result))
     parsed = _safe_parse_json(raw_text) or None
+    # Enforce max count & prune duplicates if parsed
+    if parsed and isinstance(parsed, dict) and isinstance(parsed.get('stories'), list):
+        seen = set()
+        deduped = []
+        for s in parsed['stories']:
+            title = (s.get('title') if isinstance(s, dict) else None) or ''
+            norm = title.strip().lower()
+            if not title.strip():
+                continue
+            if norm in seen:
+                continue
+            seen.add(norm)
+            deduped.append(s)
+            if len(deduped) >= max_stories:
+                break
+        parsed['stories'] = deduped
     return {
         "success": parsed is not None,
         "data": parsed,
@@ -119,7 +211,7 @@ async def _demo() -> None:
         "As a product team we need an in-app notification center so users can see real-time "
         "updates about project events (new comments, status changes, assignments) without refreshing."
     )
-    outcome = await decompose_epic(epic)
+    outcome = await decompose_epic(epic, max_stories=5)
     print("=== Epic Decomposition Outcome ===")
     print(json.dumps(outcome, indent=2))
 

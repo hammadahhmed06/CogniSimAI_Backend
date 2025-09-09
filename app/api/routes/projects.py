@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import datetime
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict
 from enum import Enum
@@ -11,6 +12,46 @@ except Exception:  # pragma: no cover - safety import
     APIError = Exception  # type: ignore
 
 router = APIRouter(prefix="/api/projects", tags=["Projects"], dependencies=[Depends(get_current_user)])
+@router.get("/{project_id}/metrics/summary")
+def project_metrics_summary(project_id: UUID, current_user: UserModel = Depends(get_current_user)):
+    # Basic placeholder metrics derived from issues; refine later
+    issues_res = supabase.table("issues").select("id,status,started_at,done_at,story_points").eq("project_id", str(project_id)).eq("owner_id", str(current_user.id)).execute()
+    rows = getattr(issues_res, 'data', []) or []
+    wip = sum(1 for r in rows if r.get('status') == 'in_progress')
+    done_recent: int = 0
+    try:
+        now = datetime.utcnow()
+        for r in rows:
+            da = r.get('done_at')
+            if da:
+                try:
+                    dt = datetime.fromisoformat(da.replace('Z','+00:00'))
+                    if (now - dt).days < 21:
+                        done_recent += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # naive velocity: done issues with story_points in last 3 pseudo-sprints (7d windows)
+    velocity_last_3 = done_recent
+    # cycle time average (started->done) for done issues
+    durations = []
+    for r in rows:
+        if r.get('started_at') and r.get('done_at'):
+            try:
+                st = datetime.fromisoformat(str(r['started_at']).replace('Z','+00:00'))
+                dn = datetime.fromisoformat(str(r['done_at']).replace('Z','+00:00'))
+                durations.append((dn - st).total_seconds()/86400.0)
+            except Exception:
+                continue
+    avg_cycle_time_days = sum(durations)/len(durations) if durations else None
+    return {
+        "velocity_last_3": velocity_last_3,
+        "avg_cycle_time_days": avg_cycle_time_days,
+        "wip_count": wip,
+        "issue_count": len(rows)
+    }
+
 
 class ProjectType(str, Enum):
     scrum = "scrum"
