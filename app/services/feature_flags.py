@@ -10,7 +10,7 @@ logger = logging.getLogger("cognisim_ai")
 # A simple in-memory cache for the feature flags
 _feature_flag_cache = {}
 
-async def load_feature_flags(supabase_client: Client):
+def load_feature_flags(supabase_client: Client):
     """
     Loads all feature flags from the database into the in-memory cache.
     This should be called on application startup.

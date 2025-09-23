@@ -31,6 +31,19 @@ class AgentRunModel(BaseModel):
     created_issue_ids: Optional[list[UUID]] = None
     started_at: datetime
     ended_at: Optional[datetime] = None
+    # Observability fields (may be null if legacy run)
+    prompt_version: Optional[str] = None
+    # Phase 5: experimentation / variant tracking
+    prompt_variant_id: Optional[UUID] = None
+    team_id: Optional[UUID] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    latency_ms: Optional[int] = None
+    cost_usd_estimate: Optional[float] = None
+    # Phase 3 metrics
+    quality_score: Optional[float] = None
+    warnings_count: Optional[int] = None
 
 
 class AgentRunCreate(BaseModel):
@@ -41,6 +54,16 @@ class AgentRunCreate(BaseModel):
     user_id: UUID
     status: str = "running"
     input: Optional[dict[str, Any]] = None
+    prompt_version: Optional[str] = None
+    prompt_variant_id: Optional[UUID] = None
+    team_id: Optional[UUID] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    latency_ms: Optional[int] = None
+    cost_usd_estimate: Optional[float] = None
+    quality_score: Optional[float] = None
+    warnings_count: Optional[int] = None
 
 
 class AgentRunUpdate(BaseModel):
@@ -49,6 +72,15 @@ class AgentRunUpdate(BaseModel):
     error: Optional[str] = None
     created_issue_ids: Optional[list[UUID]] = None
     ended_at: Optional[datetime] = None
+    prompt_version: Optional[str] = None
+    prompt_variant_id: Optional[UUID] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    latency_ms: Optional[int] = None
+    cost_usd_estimate: Optional[float] = None
+    quality_score: Optional[float] = None
+    warnings_count: Optional[int] = None
 
 
 class AgentRunItemCreate(BaseModel):

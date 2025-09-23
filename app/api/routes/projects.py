@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict
 from enum import Enum
 from uuid import UUID, uuid4
-from app.core.dependencies import supabase, get_current_user, UserModel
+from app.core.dependencies import supabase, get_current_user, UserModel, get_workspace_context, WorkspaceContext
 try:
     # postgrest APIError used for graceful fallback if legacy schema lacks column
     from postgrest.exceptions import APIError  # type: ignore
@@ -12,6 +12,33 @@ except Exception:  # pragma: no cover - safety import
     APIError = Exception  # type: ignore
 
 router = APIRouter(prefix="/api/projects", tags=["Projects"], dependencies=[Depends(get_current_user)])
+
+# ---- Access control helpers ----
+def _user_team_ids(workspace_id: UUID, user_id: UUID) -> list[str]:
+    res = (
+        supabase.table("team_members")
+        .select("team_id,teams!inner(id,workspace_id)")
+        .eq("user_id", str(user_id))
+        .eq("teams.workspace_id", str(workspace_id))
+        .execute()
+    )
+    return [r.get("team_id") for r in (getattr(res, "data", []) or []) if r.get("team_id")]
+
+def _project_visible_to_user(project_row: dict, workspace_id: UUID, user_id: UUID) -> bool:
+    if str(project_row.get('workspace_id')) != str(workspace_id):
+        return False
+    # Owner always sees
+    if str(project_row.get('owner_id')) == str(user_id):
+        return True
+    # Shared access via project_team_access
+    try:
+        team_ids = _user_team_ids(workspace_id, user_id)
+        if not team_ids:
+            return False
+        acc = supabase.table("project_team_access").select("id").eq("project_id", str(project_row.get('id'))).in_("team_id", team_ids).limit(1).execute()
+        return bool(getattr(acc, 'data', []) or [])
+    except Exception:
+        return False
 @router.get("/{project_id}/metrics/summary")
 def project_metrics_summary(project_id: UUID, current_user: UserModel = Depends(get_current_user)):
     # Basic placeholder metrics derived from issues; refine later
@@ -193,35 +220,37 @@ def _log_project_activity(project_id: UUID, user_id: UUID, action: str, meta: Op
         pass
 
 @router.get("", response_model=List[Project])
-def list_projects(q: Optional[str] = None, status: Optional[str] = None, current_user: UserModel = Depends(get_current_user)):
+def list_projects(q: Optional[str] = None, status: Optional[str] = None, ctx: WorkspaceContext = Depends(get_workspace_context), current_user: UserModel = Depends(get_current_user)):
     """List projects with optional text search (name/key) and status filter.
     status may be 'active' or 'archived'. If omitted returns all owned projects."""
     try:
         query = supabase.table("projects").select(
-            "id,name,key,type,description,status,created_at,updated_at,archived_at,slug"
-        ).eq("owner_id", str(current_user.id))
+            "id,name,key,type,description,status,created_at,updated_at,archived_at,slug,workspace_id,owner_id"
+        ).eq("workspace_id", str(ctx.workspace_id))
         if status in {"active", "archived"}:
             query = query.eq("status", status)
         res = query.execute()
     except APIError as e:  # legacy schema missing 'type'
         if 'type' in str(e):
             try:
-                query = supabase.table("projects").select("id,name,key,description,status,created_at,updated_at,archived_at").eq("owner_id", str(current_user.id))
+                query = supabase.table("projects").select("id,name,key,description,status,created_at,updated_at,archived_at").eq("owner_id", str(current_user.id)).eq("workspace_id", str(ctx.workspace_id))
                 if status in {"active", "archived"}:
                     query = query.eq("status", status)
                 res = query.execute()
             except Exception:
-                res = supabase.table("projects").select("id,name,key").eq("owner_id", str(current_user.id)).execute()
+                res = supabase.table("projects").select("id,name,key").eq("owner_id", str(current_user.id)).eq("workspace_id", str(ctx.workspace_id)).execute()
         else:
             raise
     data = getattr(res, 'data', []) or []
+    # Filter to those owned by user or shared to user's teams
+    data = [p for p in data if _project_visible_to_user(p, ctx.workspace_id, current_user.id)]
     if q:
         q_low = q.lower()
         data = [p for p in data if (p.get('name','').lower().find(q_low) != -1) or (p.get('key','').lower().find(q_low) != -1)]
     return [_project_from_row(p) for p in data]
 
 @router.get("/paginated")
-def list_projects_paginated(q: Optional[str] = None, status: Optional[str] = None, limit: int = 20, offset: int = 0, current_user: UserModel = Depends(get_current_user)):
+def list_projects_paginated(q: Optional[str] = None, status: Optional[str] = None, limit: int = 20, offset: int = 0, ctx: WorkspaceContext = Depends(get_workspace_context), current_user: UserModel = Depends(get_current_user)):
     """Paginated projects list returning metadata. Maintains same filtering semantics as list_projects.
     Returns: { items: Project[], total: int, limit: int, offset: int }"""
     if limit > 100:
@@ -230,23 +259,24 @@ def list_projects_paginated(q: Optional[str] = None, status: Optional[str] = Non
         offset = 0
     try:
         query = supabase.table("projects").select(
-            "id,name,key,type,description,status,created_at,updated_at,archived_at,slug"
-        ).eq("owner_id", str(current_user.id))
+            "id,name,key,type,description,status,created_at,updated_at,archived_at,slug,workspace_id,owner_id"
+        ).eq("workspace_id", str(ctx.workspace_id))
         if status in {"active", "archived"}:
             query = query.eq("status", status)
         res = query.execute()
     except APIError as e:
         if 'type' in str(e):
             try:
-                query = supabase.table("projects").select("id,name,key,description,status,created_at,updated_at,archived_at").eq("owner_id", str(current_user.id))
+                query = supabase.table("projects").select("id,name,key,description,status,created_at,updated_at,archived_at").eq("owner_id", str(current_user.id)).eq("workspace_id", str(ctx.workspace_id))
                 if status in {"active", "archived"}:
                     query = query.eq("status", status)
                 res = query.execute()
             except Exception:
-                res = supabase.table("projects").select("id,name,key").eq("owner_id", str(current_user.id)).execute()
+                res = supabase.table("projects").select("id,name,key").eq("owner_id", str(current_user.id)).eq("workspace_id", str(ctx.workspace_id)).execute()
         else:
             raise
     data = getattr(res, 'data', []) or []
+    data = [p for p in data if _project_visible_to_user(p, ctx.workspace_id, current_user.id)]
     if q:
         q_low = q.lower()
         data = [p for p in data if (p.get('name','').lower().find(q_low) != -1) or (p.get('key','').lower().find(q_low) != -1)]
@@ -260,7 +290,7 @@ def list_projects_paginated(q: Optional[str] = None, status: Optional[str] = Non
     }
 
 @router.get("/stats-batch")
-def batch_project_stats(ids: str, current_user: UserModel = Depends(get_current_user)):
+def batch_project_stats(ids: str, ctx: WorkspaceContext = Depends(get_workspace_context), current_user: UserModel = Depends(get_current_user)):
     """Return lightweight category_counts for multiple projects.
     Query param ids is comma-separated project UUIDs.
     Response shape: { project_id: { todo: int, in_progress: int, done: int } }"""
@@ -269,7 +299,7 @@ def batch_project_stats(ids: str, current_user: UserModel = Depends(get_current_
     if not id_list:
         return {}
     # Ensure ownership: fetch allowed ids
-    allowed_res = supabase.table("projects").select("id").in_("id", id_list).eq("owner_id", str(current_user.id)).execute()
+    allowed_res = supabase.table("projects").select("id").in_("id", id_list).eq("owner_id", str(current_user.id)).eq("workspace_id", str(ctx.workspace_id)).execute()
     allowed_rows = getattr(allowed_res, 'data', []) or []
     allowed_ids = {r.get('id') for r in allowed_rows if r.get('id')}
     if not allowed_ids:
@@ -306,28 +336,14 @@ def get_project_by_slug(slug: str, current_user: UserModel = Depends(get_current
     return ProjectDetail(**proj.dict(), items_count=items_count, active_sprint_id=active_sprint_id)
 
 @router.post("", response_model=Project, status_code=status.HTTP_201_CREATED)
-def create_project(body: ProjectCreate, current_user: UserModel = Depends(get_current_user)):
+def create_project(body: ProjectCreate, ctx: WorkspaceContext = Depends(get_workspace_context), current_user: UserModel = Depends(get_current_user)):
     key = _normalize_key(body.key)
     existing = supabase.table("projects").select("id").eq("owner_id", str(current_user.id)).eq("key", key).maybe_single().execute()
     if getattr(existing, "data", None):
         raise HTTPException(status_code=400, detail="Project key already exists")
     
-    # Get or create default workspace
-    workspace_res = supabase.table("workspaces").select("id").limit(1).execute()
-    workspace_data = getattr(workspace_res, "data", [])
-    
-    if not workspace_data:
-        # Create default workspace
-        workspace_payload = {
-            "id": str(uuid4()),
-            "name": f"{current_user.email}'s Workspace"
-        }
-        workspace_ins = supabase.table("workspaces").insert(workspace_payload).execute()
-        workspace_data = getattr(workspace_ins, "data", [])
-        if not workspace_data:
-            raise HTTPException(status_code=500, detail="Failed to create workspace")
-    
-    workspace_id = workspace_data[0]["id"]
+    # Use active workspace context; assume membership validated in dependency
+    workspace_id = str(ctx.workspace_id)
     
     base_payload = {
         "id": str(uuid4()), 
@@ -373,10 +389,14 @@ def create_project(body: ProjectCreate, current_user: UserModel = Depends(get_cu
     return proj
 
 @router.get("/{project_id}", response_model=ProjectDetail)
-def get_project_detail(project_id: UUID, current_user: UserModel = Depends(get_current_user)):
-    res = supabase.table("projects").select("id,name,key,type,description,status,created_at,updated_at,archived_at,slug").eq("id", str(project_id)).eq("owner_id", str(current_user.id)).maybe_single().execute()
+def get_project_detail(project_id: UUID, ctx: WorkspaceContext = Depends(get_workspace_context), current_user: UserModel = Depends(get_current_user)):
+    res = supabase.table("projects").select("id,name,key,type,description,status,created_at,updated_at,archived_at,slug,workspace_id,owner_id").eq("id", str(project_id)).maybe_single().execute()
     row = getattr(res, 'data', None)
     if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if str(row.get('workspace_id')) != str(ctx.workspace_id):
+        raise HTTPException(status_code=403, detail="Cross-workspace access denied")
+    if not _project_visible_to_user(row, ctx.workspace_id, current_user.id):
         raise HTTPException(status_code=404, detail="Project not found")
     items_res = supabase.table("items").select("id").eq("project_id", str(project_id)).execute()
     items_count = len(getattr(items_res, 'data', []) or [])
@@ -389,13 +409,81 @@ def get_project_detail(project_id: UUID, current_user: UserModel = Depends(get_c
     proj = _project_from_row(row)
     return ProjectDetail(**proj.dict(), items_count=items_count, active_sprint_id=active_sprint_id)
 
+# ---- Sharing endpoints (owner only) ----
+class AccessGrant(BaseModel):
+    team_id: UUID
+    role: str  # viewer|editor|admin
+
+class AccessUpdate(BaseModel):
+    role: str
+
+class AccessEntry(BaseModel):
+    id: UUID
+    team_id: UUID
+    role: str
+    created_at: Optional[str] = None
+
+def _ensure_owner(project_id: UUID, user_id: UUID):
+    proj = supabase.table("projects").select("id,owner_id").eq("id", str(project_id)).maybe_single().execute()
+    row = getattr(proj, 'data', None)
+    if not row or str(row.get('owner_id')) != str(user_id):
+        raise HTTPException(status_code=403, detail="Only owner can manage access")
+
+@router.get("/{project_id}/access", response_model=List[AccessEntry])
+def list_access(project_id: UUID, current_user: UserModel = Depends(get_current_user)):
+    _ensure_owner(project_id, current_user.id)
+    res = supabase.table("project_team_access").select("id,team_id,role,created_at").eq("project_id", str(project_id)).execute()
+    rows = getattr(res, 'data', []) or []
+    out: List[AccessEntry] = []
+    for r in rows:
+        try:
+            out.append(AccessEntry(id=r['id'], team_id=r['team_id'], role=r['role'], created_at=r.get('created_at')))
+        except Exception:
+            continue
+    return out
+
+@router.post("/{project_id}/access", response_model=AccessEntry)
+def grant_access(project_id: UUID, body: AccessGrant, current_user: UserModel = Depends(get_current_user)):
+    if body.role not in {"viewer","editor","admin"}:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    _ensure_owner(project_id, current_user.id)
+    ins = supabase.table("project_team_access").upsert({
+        "project_id": str(project_id),
+        "team_id": str(body.team_id),
+        "role": body.role,
+        "granted_by": str(current_user.id)
+    }).execute()
+    row = (getattr(ins, 'data', []) or [None])[0]
+    if not row:
+        raise HTTPException(status_code=500, detail="Failed to grant access")
+    return AccessEntry(id=row['id'], team_id=row['team_id'], role=row['role'], created_at=row.get('created_at'))
+
+@router.patch("/{project_id}/access/{access_id}", response_model=AccessEntry)
+def update_access(project_id: UUID, access_id: UUID, body: AccessUpdate, current_user: UserModel = Depends(get_current_user)):
+    if body.role not in {"viewer","editor","admin"}:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    _ensure_owner(project_id, current_user.id)
+    upd = supabase.table("project_team_access").update({"role": body.role}).eq("id", str(access_id)).eq("project_id", str(project_id)).execute()
+    row = (getattr(upd, 'data', []) or [None])[0]
+    if not row:
+        raise HTTPException(status_code=404, detail="Access entry not found")
+    return AccessEntry(id=row['id'], team_id=row['team_id'], role=row['role'], created_at=row.get('created_at'))
+
+@router.delete("/{project_id}/access/{access_id}")
+def revoke_access(project_id: UUID, access_id: UUID, current_user: UserModel = Depends(get_current_user)):
+    _ensure_owner(project_id, current_user.id)
+    supabase.table("project_team_access").delete().eq("id", str(access_id)).eq("project_id", str(project_id)).execute()
+    return {"success": True}
+
 @router.patch("/{project_id}", response_model=Project)
-def update_project(project_id: UUID, body: ProjectUpdate, current_user: UserModel = Depends(get_current_user)):
+def update_project(project_id: UUID, body: ProjectUpdate, ctx: WorkspaceContext = Depends(get_workspace_context), current_user: UserModel = Depends(get_current_user)):
     # Fetch existing
-    existing = supabase.table("projects").select("id,name,key,type,description,status,created_at,updated_at,slug").eq("id", str(project_id)).eq("owner_id", str(current_user.id)).maybe_single().execute()
+    existing = supabase.table("projects").select("id,name,key,type,description,status,created_at,updated_at,slug,workspace_id").eq("id", str(project_id)).eq("owner_id", str(current_user.id)).maybe_single().execute()
     row = getattr(existing, 'data', None)
     if not row:
         raise HTTPException(status_code=404, detail="Project not found")
+    if str(row.get('workspace_id')) != str(ctx.workspace_id):
+        raise HTTPException(status_code=403, detail="Cross-workspace access denied")
     update_data: dict[str, Any] = {}
     name_changed = False
     if body.name is not None:

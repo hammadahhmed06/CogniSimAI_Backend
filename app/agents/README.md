@@ -130,11 +130,103 @@ Refer to `docs/REFACTOR_PLAN.md` for cross‑team phased roadmap.
 
 Quick Dev Checklist (Active Slice)
 ----------------------------------
-1. Persist run lifecycle (dry run) with tokens + latency.
-2. Hub widget: recent runs list.
-3. Run detail modal + provenance badge link.
-4. Commit UI: edit + bulk create + provenance.
-5. Feedback capture (rating + diff).
+Phase 1 (Observability Foundation) Status:
+- [x] Migration: add prompt_version + token + latency + cost columns
+- [x] Backend models updated
+- [x] Instrument epic_decompose endpoint (latency_ms, token heuristics, cost)
+- [x] API: existing /runs & /runs/{id} now expose metrics
+- [ ] Frontend widget (recent runs + metrics)
+- [ ] Optional backfill script (legacy rows zero-fill) – skipped for now
+
+Phase 2 (Validation & Repair) Status:
+- [x] Schema validation (strict field & type checks)
+- [x] JSON repair cascade (balanced braces + heuristic bullet/numbered list reconstruction)
+- [x] Acceptance criteria lint (vague terms, length, empty, >12 items) with warnings surfaced
+- [x] Normalization & dedupe centralized in agent layer
+- [x] Unit tests (schema valid/invalid, dedupe+limit, lint vague term, multi-stage repair)
+
+Phase 3 (Retrieval & Quality Scoring) Status:
+- [x] Migration: embeddings table + quality_score & warnings_count columns
+- [x] Embedding utility (Gemini + offline fallback)
+- [x] Duplicate semantic detection (threshold 0.85) with warnings
+- [x] Quality score computation (distinctness, criteria density, warning penalty, structure)
+- [x] Persist embeddings for newly created child issues (commit path)
+- [x] Endpoint enhancement: expose duplicate_matches directly (list & detail endpoints updated)
+- [x] Frontend: show quality_score badge & duplicate markers (EpicDecomposer page + components)
+- [x] Accurate tokenizer integration replacing heuristic (tiktoken fallback to heuristic)
+
+Phase 4 (Regeneration & Interactive Improvement) — Completed Core
+Goal: Targeted refinement after initial generation, closing the loop between quality metrics and user feedback.
+
+Delivered:
+1. Per-story regeneration endpoint: `POST /api/agents/epic/decompose/{run_id}/stories/{index}/regenerate` (dry_run runs)
+2. Per-story sub-scores: distinctness contribution & criteria density in regeneration response
+3. Feedback capture: `POST /feedback` storing rating + edit distance diffs in `agent_run_items.metadata`
+4. Adaptive prompt versioning: `prompt_version` auto-increments on each regeneration
+5. Embedding reuse: only regenerated story re-embedded; existing issue embeddings fetched/cached
+6. Guardrails: daily regeneration quota (100), per-run regen cap (20), cost/token estimation endpoint
+7. Cost estimation: `GET /regenerate/estimate` returns token + USD estimate and remaining quota
+8. Frontend modal integration: regeneration button, estimate button with token+cost display, feedback (rating+comment), duplicate warnings updated
+9. Stub regeneration fallback: works without GEMINI_API_KEY (marks warning)
+
+Success Criteria Met:
+- Single-story regen leaves other stories intact & updates run output atomically
+- Duplicate detection + quality recompute incremental
+- Feedback persisted with edit distances
+- Guardrails return 429 when exceeded
+
+Phase 4 Residual Polish (Optional):
+- [ ] Display prompt_version & regen_count in UI (currently backend only)
+- [ ] Show sub-scores (distinctness, criteria_density) visually per regen
+- [ ] Expose remaining daily regenerations from estimate endpoint in modal header
+- [ ] Add before/after diff highlight for regenerated story
+- [ ] Quality score badge live-update post-regeneration in modal
+- [ ] Documentation snippet in main README explaining interactive loop
+- [ ] Analytics aggregation job for feedback stats (future phase)
+
+After Phase 4 the agent is interactive and ready for Phase 5 (feedback-driven optimization & A/B testing of prompts / scoring heuristics).
+
+Phase 5 (Feedback-Driven Optimization & Experimentation) Plan
+------------------------------------------------------------
+Objective: Use collected feedback (ratings + edit distances + regeneration behavior) to iteratively tune prompts, improve quality_score, and validate changes via controlled experiments.
+
+Initial Slice Implemented:
+- [x] Aggregated feedback metrics endpoint: `GET /api/agents/feedback/metrics?days=30` (avg rating, edit distances, distribution, criteria density proxy).
+
+Planned Iterations:
+1. Prompt Variant Registry
+  - Table: `prompt_variants(id, name, template, created_at, active, notes)`
+  - Endpoint: list/create variants.
+2. Experiment Runs
+  - Allow specifying `prompt_variant_id` when generating; store on `agent_runs`.
+  - Allocation strategy (A/B split) service.
+3. Offline Evaluation Harness
+  - Fixed sample of historical epics; replay with variant prompts; compute quality deltas.
+4. Scoring Enhancements
+  - Incorporate edit distance penalty/bonus into quality_score adjustments over time.
+  - Track regression guard: block deployment if avg rating drops > X% vs baseline.
+5. Analytics Dashboard (Frontend)
+  - Charts: rating trend, edit distance distributions, criteria count distribution, duplicate rate.
+6. Adaptive Prompt Selection (Later)
+  - Auto-promote variant after N runs if statistically significant improvement.
+7. Cost-Aware Scoring
+  - Efficiency metric: quality_score per 1K tokens; highlight variants that improve cost efficiency.
+
+Success KPIs:
+- Maintain or improve avg rating (target ≥ baseline +5%).
+- Reduce average edit_distance_title by ≥10% while criteria count stays within 3–6.
+- Keep duplicate warning rate < 15% across runs.
+
+Next Up (Actionable):
+- Implement `prompt_variants` migration & CRUD endpoints.
+- Add `prompt_variant_id` column to `agent_runs` for future A/B.
+
+
+Next after Phase 3:
+1. Per-story regeneration endpoint
+2. Glossary/domain memory injection
+3. Feedback loop scoring (user edits & acceptance) influencing prompt versioning
+4. Cost governance (per-user/project quota + budget alerts)
 
 Contact / Ownership
 -------------------

@@ -14,7 +14,12 @@ from app.api.routes.integrations import router as integrations_router
 from app.api.routes.projects import router as projects_router
 from app.api.routes.issues import router as issues_router
 from app.api.routes.agents import router as agents_router
+from app.api.routes.teams import router as teams_router
 from app.api.routes.workspaces import router as workspaces_router
+from app.api.routes.subscribe import router as subscribe_router
+from app.api.routes.auth_invite import router as auth_invite_router
+from app.api.routes.members import router as members_router
+from app.api.routes.account import router as account_router
 from app.core.dependencies import get_current_user, UserModel, supabase, limiter, ErrorResponse, require_role
 # --- 1. Initial Configuration & Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -67,7 +72,7 @@ async def startup_event():
     This function runs once when the application starts.
     It loads the feature flags from the database into the cache.
     """
-    await load_feature_flags(supabase)
+    load_feature_flags(supabase)
     logger.info("Application startup complete. Feature flags loaded.")
 
 # --- 2. Dependencies imported from app.core.dependencies to avoid circular imports ---
@@ -125,3 +130,8 @@ app.include_router(projects_router)
 app.include_router(workspaces_router)
 app.include_router(issues_router)
 app.include_router(agents_router)
+app.include_router(teams_router)
+app.include_router(members_router)
+app.include_router(subscribe_router)
+app.include_router(auth_invite_router)
+app.include_router(account_router)

@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     # For development, we can use a simple encoding instead of encryption
     DEV_MODE: bool = True
 
+    # --- Team Quotas ---
+    # Daily cap on agent runs per team
+    TEAM_DAILY_RUN_LIMIT: int = 100
+    # Optional token budget over last 30 days (sum of input+output tokens)
+    TEAM_30D_TOKEN_LIMIT: Optional[int] = None
+
 
 # Create a single, importable instance of the settings
 settings = Settings()
