@@ -165,7 +165,7 @@ class IssueSearchResponse(IssueListResponse):
     query: Optional[str] = None
 
 @router.get("", response_model=IssueListResponse)
-def list_issues(q: Optional[str] = None, status: Optional[str] = None, project_id: Optional[UUID] = None, workspace_id: Optional[UUID] = None, priority: Optional[str] = None, type: Optional[str] = None, epic_id: Optional[UUID] = None, sprint_id: Optional[UUID] = None, limit: int = 50, offset: int = 0, current_user: UserModel = Depends(get_current_user)):
+def list_issues(q: Optional[str] = None, status: Optional[str] = None, project_id: Optional[UUID] = None, workspace_id: Optional[UUID] = None, priority: Optional[str] = None, type: Optional[str] = None, epic_id: Optional[UUID] = None, sprint_id: Optional[UUID] = None, limit: int = 50, offset: int = 0, include_archived_projects: bool = False, include_orphan: bool = False, current_user: UserModel = Depends(get_current_user)):
     if limit > 100:
         limit = 100
     if offset < 0:
@@ -194,6 +194,32 @@ def list_issues(q: Optional[str] = None, status: Optional[str] = None, project_i
             "id,issue_key,title,status,priority,type,project_id,workspace_id,assignee_name,description,epic_id,story_points,business_value,effort_estimate,risk_level,acceptance_criteria,sprint_id,backlog_rank,started_at,done_at,priority_score,priority_score_meta,created_at,updated_at"
         ).eq("owner_id", str(current_user.id)).execute()
     rows = getattr(res, 'data', []) or []
+    # Exclude issues from archived or deleted projects by default when no specific project filter is applied
+    # Also exclude orphan issues (no project_id) by default unless include_orphan=true
+    if not project_id and not include_archived_projects:
+        try:
+            # Collect distinct project_ids present in the result set
+            proj_ids = sorted({str(r.get('project_id')) for r in rows if r.get('project_id')})
+            active_ids: Set[str] = set()
+            if proj_ids:
+                proj_query = supabase.table("projects").select("id,status,workspace_id,owner_id").in_("id", proj_ids)
+                # Scope by owner
+                proj_query = proj_query.eq("owner_id", str(current_user.id))
+                # If a workspace context was provided, use it to narrow down
+                if workspace_id:
+                    proj_query = proj_query.eq("workspace_id", str(workspace_id))
+                proj_res = proj_query.execute()
+                proj_rows = getattr(proj_res, 'data', []) or []
+                active_ids = {r.get('id') for r in proj_rows if (r.get('status') or 'active') != 'archived' and r.get('id')}
+            def _keep(row: dict) -> bool:
+                pid = row.get('project_id')
+                if not pid:
+                    return bool(include_orphan)
+                return str(pid) in active_ids
+            rows = [r for r in rows if _keep(r)]
+        except Exception:
+            # Best-effort filter; if anything fails, return unfiltered to avoid breaking
+            pass
     if q:
         q_low = q.lower()
         rows = [r for r in rows if q_low in (r.get('title') or '').lower() or q_low in (r.get('issue_key') or '').lower()]

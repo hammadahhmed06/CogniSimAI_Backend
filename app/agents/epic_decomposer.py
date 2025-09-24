@@ -62,6 +62,7 @@ if not GEMINI_API_KEY:
 
 
 # Gemini via OpenAI-compatible endpoint (reference: https://ai.google.dev/gemini-api/docs/openai)
+MODEL_NAME = "gemini-2.5-flash"
 client = AsyncOpenAI(
     api_key=GEMINI_API_KEY or "",  # Empty key allows graceful failure path
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -70,10 +71,13 @@ client = AsyncOpenAI(
 
 BASE_INSTRUCTIONS = (
     "You are an Epic Decomposition Assistant. You will receive an EPIC_CONTEXT section. "
-    "Generate user stories ONLY for scope actually described there. Avoid duplication of existing child stories. "
-    "Return STRICT JSON: {\\n  epic: string,\\n  stories: [ { title: string, acceptance_criteria: string[] } ]\\n}. "
-    "Titles: concise (<= 12 words), distinct, user-value oriented. Acceptance criteria: 2-6 bullet-quality statements phrased as observable outcomes (no future tense, no vague words like 'should work'). "
-    "No markdown, no explanations outside JSON."
+    "Your job: propose USER STORIES only (type=story). Do NOT propose tasks, subtasks, or new epics. "
+    "Scope discipline: generate stories ONLY for functionality actually described in EPIC_CONTEXT. If scope is insufficient, return an empty stories array. "
+    "Guardrails: avoid duplication with EXISTING_CHILD_STORIES. Keep each story distinct and user-value oriented. "
+    "Output format (JSON ONLY): {\\n  epic: string,\\n  stories: [ { title: string, acceptance_criteria: string[] } ]\\n}. "
+    "Titles: concise (<= 12 words), outcome-focused, no implementation details. "
+    "Acceptance criteria: 2-6 clear, testable statements phrased as observable outcomes; avoid vague terms (should/could/maybe/some/various/appropriate). "
+    "NO markdown, NO commentary—return ONLY the JSON object."
 )
 
 
@@ -279,7 +283,7 @@ def _final_normalize(stories: List[Dict[str, Any]], max_stories: int) -> Tuple[L
     return dedup, warn
 
 
-async def decompose_epic(epic_description: str, max_stories: int = 6, epic_id: str | None = None) -> Dict[str, Any]:
+async def decompose_epic(epic_description: str, max_stories: int = 6, epic_id: str | None = None, user_prompt: str | None = None) -> Dict[str, Any]:
     """Run the agent to decompose an epic and return structured JSON.
 
     Returns a dict with keys:
@@ -307,29 +311,39 @@ async def decompose_epic(epic_description: str, max_stories: int = 6, epic_id: s
         existing_children, _ = _fetch_existing_children(epic_id)
     children_summary = _summarize_children(existing_children)
 
+    # Guardrails: treat user_prompt as guidance only, not new scope. Strip excessive length.
+    safe_user_prompt = None
+    if user_prompt:
+        up = user_prompt.strip()
+        if up:
+            safe_user_prompt = up[:800]
+
     dynamic_instructions = (
-        f"{BASE_INSTRUCTIONS}\n" \
+        f"{BASE_INSTRUCTIONS}\n"
         f"Required story count: up to {max_stories} stories (fewer allowed if scope is small). Do NOT exceed {max_stories}. "
-        f"If functionality already represented in EXISTING_CHILD_STORIES skip it."
+        f"If functionality already represented in EXISTING_CHILD_STORIES skip it. "
+        f"If USER_GUIDANCE is provided, use it ONLY to refine clarity (e.g., target sections, emphasis, example outcomes). "
+        f"Do NOT invent functionality absent from EPIC_CONTEXT; if USER_GUIDANCE expands scope beyond EPIC_CONTEXT, ignore the expansion."
     )
 
     agent = Agent(
         name="EpicDecomposer",
         instructions=dynamic_instructions,
         model=OpenAIChatCompletionsModel(
-            model="gemini-2.5-flash",
+            model=MODEL_NAME,
             openai_client=client,
         ),
     )
 
-    user_prompt = (
+    user_message = (
         "EPIC_CONTEXT:\n" + epic_description + "\n\n" +
         "EXISTING_CHILD_STORIES:\n" + children_summary + "\n\n" +
+        ("USER_GUIDANCE:\n" + safe_user_prompt + "\n\n" if safe_user_prompt else "") +
         "Respond with JSON now."
     )
 
     try:
-        result = await Runner.run(agent, user_prompt)
+        result = await Runner.run(agent, user_message)
     except Exception as exc:  # Broad catch to return structured error
         return {
             "success": False,
@@ -427,6 +441,14 @@ async def decompose_epic(epic_description: str, max_stories: int = 6, epic_id: s
         "quality_score": quality_score,
         "warnings_count": len(warnings_combined),
     }
+
+
+async def regenerate_story(epic_description: str, epic_id: str | None = None, guidance: str | None = None) -> Dict[str, Any]:
+    """Regenerate a single improved story using the same guardrails and parsing.
+
+    Returns the same envelope as decompose_epic, but with at most one story.
+    """
+    return await decompose_epic(epic_description=epic_description, max_stories=1, epic_id=epic_id, user_prompt=guidance)
 
 
 async def _demo() -> None:

@@ -33,8 +33,6 @@ class AgentRunModel(BaseModel):
     ended_at: Optional[datetime] = None
     # Observability fields (may be null if legacy run)
     prompt_version: Optional[str] = None
-    # Phase 5: experimentation / variant tracking
-    prompt_variant_id: Optional[UUID] = None
     team_id: Optional[UUID] = None
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
@@ -55,7 +53,6 @@ class AgentRunCreate(BaseModel):
     status: str = "running"
     input: Optional[dict[str, Any]] = None
     prompt_version: Optional[str] = None
-    prompt_variant_id: Optional[UUID] = None
     team_id: Optional[UUID] = None
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
@@ -73,7 +70,6 @@ class AgentRunUpdate(BaseModel):
     created_issue_ids: Optional[list[UUID]] = None
     ended_at: Optional[datetime] = None
     prompt_version: Optional[str] = None
-    prompt_variant_id: Optional[UUID] = None
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
