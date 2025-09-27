@@ -31,7 +31,7 @@ _DRY_RUN_CACHE: dict[str, tuple[float, dict]] = {}
 router = APIRouter(prefix="/api/agents", tags=["Agents"], dependencies=[Depends(get_current_user)])
 
 class EpicDecomposeRequest(BaseModel):
-    epic_id: UUID
+    epic_id: str
     max_stories: int = Field(6, ge=1, le=MAX_STORIES)
     # Back-compat: client may still send these; ignored for logic.
     dry_run: Optional[bool] = None
@@ -59,6 +59,7 @@ class EpicDecomposeResponse(BaseModel):
     quality_score: Optional[float] = None
     warnings_count: Optional[int] = None
     duplicate_matches: Optional[List[Dict[str, Any]]] = None
+    epic_issue_key: Optional[str] = None
 
 
 class AgentRunSummary(BaseModel):
@@ -111,14 +112,58 @@ class AgentRunItem(BaseModel):
 All regenerate/estimate/feedback endpoints removed as per simplification.
 """
 
-def _validate_and_fetch_epic(epic_id: UUID, user_id: UUID) -> Dict[str, Any]:
-    epic_res = supabase.table("issues").select("id,title,type,description,project_id,workspace_id").eq("id", str(epic_id)).eq("owner_id", str(user_id)).maybe_single().execute()
-    epic = getattr(epic_res, 'data', None)
+def _validate_and_fetch_epic(epic_ref: str, user_id: UUID) -> tuple[Dict[str, Any], UUID]:
+    normalized = (epic_ref or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Epic identifier is required")
+
+    epic: Optional[Dict[str, Any]] = None
+    epic_uuid: Optional[UUID] = None
+
+    # First try to resolve as UUID
+    try:
+        candidate_uuid = UUID(normalized)
+        epic_res = (
+            supabase
+            .table("issues")
+            .select("id,title,type,description,project_id,workspace_id,issue_key")
+            .eq("id", str(candidate_uuid))
+            .eq("owner_id", str(user_id))
+            .maybe_single()
+            .execute()
+        )
+        epic = getattr(epic_res, "data", None)
+        if epic:
+            epic_uuid = candidate_uuid
+    except (ValueError, TypeError):
+        epic = None
+        epic_uuid = None
+
+    # Fall back to issue key lookup (e.g. "OR-2")
     if not epic:
+        key_normalized = normalized.upper()
+        epic_res = (
+            supabase
+            .table("issues")
+            .select("id,title,type,description,project_id,workspace_id,issue_key")
+            .eq("issue_key", key_normalized)
+            .eq("owner_id", str(user_id))
+            .maybe_single()
+            .execute()
+        )
+        epic = getattr(epic_res, "data", None)
+        if epic:
+            try:
+                epic_uuid = UUID(str(epic.get("id")))
+            except Exception as exc:  # pragma: no cover - unexpected data shape
+                raise HTTPException(status_code=500, detail="Epic record missing valid ID") from exc
+
+    if not epic or not epic_uuid:
         raise HTTPException(status_code=404, detail="Epic not found")
-    if (epic.get('type') or '').lower() != 'epic':
+    if (epic.get("type") or "").lower() != "epic":
         raise HTTPException(status_code=400, detail="Not an epic")
-    return epic
+
+    return epic, epic_uuid
 
 
 from typing import Tuple
@@ -144,38 +189,69 @@ def _normalize_stories(raw_stories: List[Dict[str, Any]], limit: int) -> Tuple[L
     return out, []
 
 
-def _create_child_issue(epic: Dict[str, Any], story: GeneratedStory, owner_id: UUID, run_id: Optional[UUID]) -> Optional[UUID]:
+def _create_child_issue(epic: Dict[str, Any], story: GeneratedStory, owner_id: UUID, run_id: Optional[UUID]) -> UUID:
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Issue service unavailable")
+
+    # Determine next sequence in project (reuse simplified logic)
     try:
-        # Determine next sequence in project (reuse simplified logic)
         if epic.get('project_id'):
             count_res = supabase.table("issues").select("id").eq("project_id", epic['project_id']).execute()
         else:
             count_res = supabase.table("issues").select("id").eq("owner_id", str(owner_id)).execute()
         seq = (len(getattr(count_res, 'data', []) or []) + 1)
-        issue_key = f"CH-{seq}"  # Simplified; future: project key or epic derived prefix
-        payload = {
-            "id": str(uuid4()),
-            "issue_key": issue_key,
-            "title": story.title,
-            "status": "todo",
-            "type": "story",
-            "project_id": epic.get('project_id'),
-            "workspace_id": epic.get('workspace_id'),
-            "description": None,
-            "epic_id": str(epic['id']),
-            "acceptance_criteria": [{"text": c, "done": False} for c in story.acceptance_criteria],
-            "owner_id": str(owner_id),
-            "search_blob": '\n'.join([story.title] + story.acceptance_criteria)[:18000],
-            "origin_run_id": str(run_id) if run_id else None,
-            "origin_method": "agent_epic_decompose" if run_id else "manual",
-        }
-        ins = supabase.table("issues").insert(payload).execute()
-        data = getattr(ins, 'data', None)
-        if data:
-            return UUID(data[0]['id'])
-    except Exception:
-        return None
-    return None
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to inspect existing issues: {exc}")
+
+    base_issue_key = f"CH-{seq}"
+    payload = {
+        "id": str(uuid4()),
+        "issue_key": base_issue_key,
+        "title": story.title,
+        "status": "todo",
+        "type": "story",
+        "project_id": epic.get('project_id'),
+        "workspace_id": epic.get('workspace_id'),
+        "description": None,
+        "epic_id": str(epic['id']),
+        "acceptance_criteria": [{"text": c, "done": False} for c in story.acceptance_criteria],
+        "owner_id": str(owner_id),
+        "search_blob": '\n'.join([story.title] + story.acceptance_criteria)[:18000],
+        "origin_run_id": str(run_id) if run_id else None,
+        "origin_method": "agent_epic_decompose" if run_id else "manual",
+    }
+
+    def _apply_unique_suffix(attempt: int) -> None:
+        if attempt == 0:
+            payload["issue_key"] = base_issue_key
+        else:
+            payload["issue_key"] = f"{base_issue_key}-{uuid4().hex[:4].upper()}"
+
+    attempts = 0
+    last_error: Optional[Any] = None
+    while attempts < 3:
+        _apply_unique_suffix(attempts)
+        try:
+            ins = supabase.table("issues").insert(payload).execute()
+        except Exception as exc:
+            last_error = exc
+            attempts += 1
+            continue
+
+        error = getattr(ins, 'error', None)
+        if error:
+            last_error = error
+            attempts += 1
+            continue
+
+        data = getattr(ins, 'data', None) or []
+        if data and data[0].get('id'):
+            return UUID(str(data[0]['id']))
+        # Some Supabase configurations return no data for insert. Since we control the ID, assume success.
+        return UUID(payload["id"])
+
+    detail = f"Failed to create story: {last_error}" if last_error else "Failed to create story"
+    raise HTTPException(status_code=502, detail=detail)
 
 
 def _compute_quality_and_duplicates(epic_id: str, stories: List[GeneratedStory]) -> tuple[Optional[float], int, List[Dict[str, Any]]]:
@@ -298,7 +374,7 @@ def _persist_run_items(run_id: UUID, stories: List['GeneratedStory']):  # forwar
 
 @router.post("/epic/decompose", response_model=EpicDecomposeResponse)
 async def epic_decompose(body: EpicDecomposeRequest, current_user: UserModel = Depends(get_current_user), ctx: TeamContext = Depends(get_team_context)):
-    epic = _validate_and_fetch_epic(body.epic_id, current_user.id)
+    epic, epic_uuid = _validate_and_fetch_epic(body.epic_id, current_user.id)
 
     # Simplified: if stories provided -> commit; else -> generate.
 
@@ -325,11 +401,12 @@ async def epic_decompose(body: EpicDecomposeRequest, current_user: UserModel = D
         agent_type="epic_decomposer",
         action="epic_decompose",
         mode=run_mode,
-        epic_id=body.epic_id,
+        epic_id=epic_uuid,
         user_id=current_user.id,
         team_id=ctx.team_id,
         input={
-            "epic_id": str(body.epic_id),
+            "epic_id": str(epic_uuid),
+            "epic_ref": body.epic_id,
             "max_stories": body.max_stories,
             "user_prompt": body.user_prompt or None,
         }
@@ -402,16 +479,19 @@ async def epic_decompose(body: EpicDecomposeRequest, current_user: UserModel = D
             if st.title.strip().lower() in existing_titles:
                 warnings.append(f"skipped duplicate story by title: {st.title}")
                 continue
-            cid = _create_child_issue(epic, st, current_user.id, run_id)
-            if cid:
-                created_ids.append(cid)
-                created_story_map.append((cid, st))
-                # update item row if persisted
-                if run_id:
-                    try:
-                        supabase.table("agent_run_items").update({"created_issue_id": str(cid), "status": "created"}).eq("run_id", str(run_id)).eq("item_index", idx).execute()
-                    except Exception:
-                        pass
+            try:
+                cid = _create_child_issue(epic, st, current_user.id, run_id)
+            except HTTPException as exc:
+                warnings.append(f"failed to create story '{st.title}': {exc.detail}")
+                continue
+            created_ids.append(cid)
+            created_story_map.append((cid, st))
+            # update item row if persisted
+            if run_id:
+                try:
+                    supabase.table("agent_run_items").update({"created_issue_id": str(cid), "status": "created"}).eq("run_id", str(run_id)).eq("item_index", idx).execute()
+                except Exception:
+                    pass
         committed = True
 
     # Persist run items for dry_run visualization (or commit pre-creation)
@@ -460,19 +540,20 @@ async def epic_decompose(body: EpicDecomposeRequest, current_user: UserModel = D
         ))
 
     return EpicDecomposeResponse(
-        epic_id=body.epic_id,
+        epic_id=epic_uuid,
         stories=stories,
         warnings=warnings,
         model=model_used,
         stub=stub,
-    dry_run=not bool(body.stories),
-    committed=committed,
+        dry_run=not bool(body.stories),
+        committed=committed,
         created_issue_ids=created_ids or None,
         run_id=run_id,
         generated_at=datetime.utcnow().isoformat() + 'Z',
         quality_score=quality_score,
         warnings_count=warnings_count,
         duplicate_matches=duplicate_matches or None,
+        epic_issue_key=(epic.get("issue_key") if isinstance(epic, dict) else None),
     )
 
 
@@ -763,30 +844,29 @@ async def commit_one_story(run_id: UUID, item_id: UUID, body: CommitOneRequest, 
 
     st = GeneratedStory(title=new_title[:160], acceptance_criteria=new_ac[:12])
     created_id = _create_child_issue(epic, st, current_user.id, run_id)
-    if created_id:
-        try:
-            supabase.table("agent_run_items").update({
-                "title": st.title,
-                "acceptance_criteria": st.acceptance_criteria,
-                "created_issue_id": str(created_id),
-                "status": "created",
-            }).eq("id", str(item_id)).execute()
-        except Exception:
-            pass
-        # append to run.created_issue_ids
-        try:
-            existing_ids = run_row.get('created_issue_ids') or []
-            existing_ids = existing_ids if isinstance(existing_ids, list) else []
-            updated_ids = [*(existing_ids or []), str(created_id)]
-            supabase.table("agent_runs").update({"created_issue_ids": updated_ids}).eq("id", str(run_id)).execute()
-        except Exception:
-            pass
+    try:
+        supabase.table("agent_run_items").update({
+            "title": st.title,
+            "acceptance_criteria": st.acceptance_criteria,
+            "created_issue_id": str(created_id),
+            "status": "created",
+        }).eq("id", str(item_id)).execute()
+    except Exception:
+        pass
+    # append to run.created_issue_ids
+    try:
+        existing_ids = run_row.get('created_issue_ids') or []
+        existing_ids = existing_ids if isinstance(existing_ids, list) else []
+        updated_ids = [*(existing_ids or []), str(created_id)]
+        supabase.table("agent_runs").update({"created_issue_ids": updated_ids}).eq("id", str(run_id)).execute()
+    except Exception:
+        pass
 
     return CommitOneResponse(
         run_id=run_id,
         item_id=item_id,
         created_issue_id=created_id,
-        status="created" if created_id else (item_row.get('status') or 'proposed'),
+        status="created",
         title=st.title,
         acceptance_criteria=st.acceptance_criteria,
     )
@@ -830,15 +910,17 @@ async def regenerate_one_story(run_id: UUID, item_id: UUID, body: RegenerateOneR
     if not feedback:
         raise HTTPException(status_code=400, detail="Feedback is required for regeneration")
     # Build guidance combining feedback
-    guidance = f"Improve clarity, specificity, and testability. Feedback: {feedback}. Keep scope unchanged."
-
-    # Use agent to regenerate a single story: reuse decompose with max_stories=1 using epic context + guidance
     prompt_source = (epic.get('description') or epic.get('title') or '')
-    agent_result = await epic_decomposer.decompose_epic(
+    original_story = {
+        "title": item_row.get('title') or '',
+        "acceptance_criteria": item_row.get('acceptance_criteria') or [],
+    }
+
+    agent_result = await epic_decomposer.regenerate_story(
         epic_description=prompt_source or 'Epic',
-        max_stories=1,
         epic_id=str(epic['id']),
-        user_prompt=guidance,
+        original_story=original_story,
+        feedback=feedback,
     )
     warnings: List[str] = []
     duplicate_matches: List[Dict[str, Any]] = []

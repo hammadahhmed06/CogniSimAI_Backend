@@ -443,12 +443,49 @@ async def decompose_epic(epic_description: str, max_stories: int = 6, epic_id: s
     }
 
 
-async def regenerate_story(epic_description: str, epic_id: str | None = None, guidance: str | None = None) -> Dict[str, Any]:
-    """Regenerate a single improved story using the same guardrails and parsing.
+async def regenerate_story(
+    epic_description: str,
+    epic_id: str | None,
+    original_story: Dict[str, Any],
+    feedback: str,
+) -> Dict[str, Any]:
+    """Regenerate a single improved story honoring user feedback.
 
-    Returns the same envelope as decompose_epic, but with at most one story.
+    We reuse the main decomposition agent but pass rich USER_GUIDANCE that includes the
+    previously generated story, its acceptance criteria, and the feedback provided by the
+    user so the model can target revisions instead of starting from scratch.
     """
-    return await decompose_epic(epic_description=epic_description, max_stories=1, epic_id=epic_id, user_prompt=guidance)
+    title = (original_story.get("title") or "").strip()
+    ac_list = original_story.get("acceptance_criteria") or []
+    if not isinstance(ac_list, list):
+        ac_list = []
+    ac_lines = []
+    for raw in ac_list[:12]:
+        if isinstance(raw, str) and raw.strip():
+            ac_lines.append(raw.strip())
+
+    guidance_sections = [
+        "You are revising an existing story. Keep the scope aligned with EPIC_CONTEXT.",
+    ]
+    if title:
+        guidance_sections.append(f"CURRENT_STORY_TITLE: {title}")
+    if ac_lines:
+        joined = "\n".join(f"- {line}" for line in ac_lines)
+        guidance_sections.append("CURRENT_ACCEPTANCE_CRITERIA:\n" + joined)
+    guidance_sections.append("USER_FEEDBACK: " + feedback)
+    guidance_sections.append(
+        "Produce a refined story that explicitly addresses the feedback, keeps the story outcome-focused, "
+        "and updates acceptance criteria accordingly. Maintain story type as 'story'."
+    )
+    guidance_sections.append("Return only JSON.")
+    guidance = "\n\n".join(guidance_sections)
+
+    return await decompose_epic(
+        epic_description=epic_description,
+        max_stories=1,
+        epic_id=epic_id,
+        user_prompt=guidance,
+    )
 
 
 async def _demo() -> None:
