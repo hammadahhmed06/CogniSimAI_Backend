@@ -1,5 +1,7 @@
 from uuid import UUID, uuid4
 from typing import List, Optional
+from datetime import datetime, timedelta
+import os
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
@@ -13,6 +15,7 @@ from app.core.dependencies import (
     get_team_context,
     team_role_required,
 )
+from app.services.email_service import send_invitation_email
 
 router = APIRouter(prefix="/api/teams", tags=["teams"])
 
@@ -301,15 +304,105 @@ async def remove_member(team_id: UUID, member_id: UUID, ctx=Depends(team_role_re
 
 
 @router.post("/{team_id}/invite")
-async def invite_member(team_id: UUID, body: InviteMemberRequest, ctx=Depends(team_role_required("admin", "owner"))):
-    admin = getattr(getattr(supabase, "auth", None), "admin", None)
-    if admin is None or not hasattr(admin, "invite_user_by_email"):
-        raise HTTPException(status_code=500, detail="Auth provider not available")
+async def invite_member(
+    team_id: UUID, 
+    body: InviteMemberRequest, 
+    ctx=Depends(team_role_required("admin", "owner")),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Send email invitation to join a team."""
+    
+    # Get team details
+    team_res = supabase.table("teams").select("id,name,workspace_id").eq("id", str(team_id)).maybe_single().execute()
+    team = getattr(team_res, "data", None)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+    
+    # Check if user already exists and is a member
+    existing_member = (
+        supabase.table("team_members")
+        .select("id,user_id")
+        .eq("team_id", str(team_id))
+        .execute()
+    )
+    member_rows = getattr(existing_member, "data", []) or []
+    
+    # Get user IDs from email - handle case where user doesn't exist yet
+    existing_user = None
     try:
-        if body.redirect:
-            admin.invite_user_by_email(body.email, options={"redirect_to": body.redirect})
-        else:
-            admin.invite_user_by_email(body.email)
-        return {"message": "Invite sent"}
+        user_res = supabase.table("user_profiles").select("user_id,email").eq("email", body.email).execute()
+        user_data = getattr(user_res, "data", [])
+        if user_data and len(user_data) > 0:
+            existing_user = user_data[0]
+    except Exception:
+        existing_user = None
+    
+    if existing_user:
+        # User exists, check if already a member
+        user_id = existing_user.get("user_id")
+        for m in member_rows:
+            if str(m.get("user_id")) == str(user_id):
+                raise HTTPException(status_code=400, detail="User is already a team member")
+    
+    # Create invitation token
+    invitation_token = uuid4()
+    expires_at = datetime.utcnow() + timedelta(days=7)
+    
+    # Store invitation in database
+    invitation_data = {
+        "id": str(uuid4()),
+        "token": str(invitation_token),
+        "email": body.email,
+        "team_id": str(team_id),
+        "workspace_id": team.get("workspace_id"),
+        "invited_by": str(current_user.id),
+        "role": body.role,
+        "status": "pending",
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    
+    try:
+        supabase.table("invitations").insert(invitation_data).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Invite failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create invitation: {str(e)}")
+    
+    # Generate invitation link
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:8080")
+    invite_link = f"{frontend_url}/accept-invite?token={invitation_token}&team={team_id}"
+    
+    # Get inviter name
+    inviter_name = "A team member"
+    try:
+        inviter_profile = supabase.table("user_profiles").select("full_name,email").eq("user_id", str(current_user.id)).execute()
+        inviter_data_list = getattr(inviter_profile, "data", [])
+        if inviter_data_list and len(inviter_data_list) > 0:
+            inviter_data = inviter_data_list[0]
+            inviter_name = inviter_data.get("full_name") or inviter_data.get("email") or "A team member"
+    except Exception:
+        pass
+    
+    # Send email
+    email_sent = False
+    email_result = None
+    try:
+        email_result = send_invitation_email(
+            to_email=body.email,
+            invite_link=invite_link,
+            inviter_name=inviter_name,
+            workspace_name=team.get("name", "a team")
+        )
+        email_sent = True
+    except Exception as e:
+        # Log error but don't fail the request
+        print(f"Failed to send invitation email: {e}")
+        email_result = {"error": str(e)}
+    
+    return {
+        "message": "Invitation created" + (" and email sent" if email_sent else " but email failed"),
+        "token": str(invitation_token),
+        "invite_link": invite_link,
+        "email_sent": email_sent,
+        "email_result": email_result,
+        "expires_at": expires_at.isoformat()
+    }

@@ -16,3 +16,4 @@ pytest
 pytest-asyncio
 openai-agents
 openai
+resend

@@ -47,6 +47,39 @@ class UpsertSkillsRequest(BaseModel):
     skills: List[dict]  # [{ name: str, level?: int, years_experience?: int }]
 
 
+def _load_user_profiles(user_ids: List[str]) -> dict[str, dict]:
+    """Best-effort fetch for user profile metadata supporting legacy schemas."""
+    if not user_ids:
+        return {}
+    identifiers = ["user_id", "id", "profile_id"]
+    normalized_ids = [str(u) for u in user_ids]
+    for identifier in identifiers:
+        try:
+            res = (
+                supabase
+                .table("user_profiles")
+                .select("*")
+                .in_(identifier, normalized_ids)
+                .execute()
+            )
+        except Exception as exc:
+            # Skip identifiers that don't exist in this schema
+            if f"user_profiles.{identifier}" in str(exc):
+                continue
+            # Any other failure: try the next identifier but remember to avoid crashing
+            continue
+        rows = getattr(res, "data", []) or []
+        if not rows:
+            return {}
+        out: dict[str, dict] = {}
+        for row in rows:
+            key = row.get(identifier) or row.get("user_id") or row.get("id") or row.get("profile_id")
+            if key:
+                out[str(key)] = row
+        return out
+    return {}
+
+
 def _workspace_user_ids(workspace_id: UUID) -> List[str]:
     # Robust approach: fetch team ids for the workspace, then collect member user_ids
     teams_res = (
@@ -94,13 +127,7 @@ async def list_members(
         return {"items": [], "total": 0, "limit": limit, "offset": offset}
     # Fetch basic identities (assuming auth schema mirrors users)
     # If you store users elsewhere, adjust this section accordingly.
-    profiles = (
-        supabase.table("user_profiles")
-        .select("user_id,full_name,title,bio,timezone,location,avatar_url,capacity_hours_week,availability_status,availability_until")
-        .in_("user_id", [str(u) for u in user_ids])
-        .execute()
-    )
-    profiles_map = {p["user_id"]: p for p in (getattr(profiles, "data", []) or [])}
+    profiles_map = _load_user_profiles(user_ids)
 
     skills_rows = (
         supabase.table("user_skills")
