@@ -20,6 +20,7 @@ from app.api.routes.subscribe import router as subscribe_router
 from app.api.routes.auth_invite import router as auth_invite_router
 from app.api.routes.members import router as members_router
 from app.api.routes.account import router as account_router
+from app.api.routes.dashboard import router as dashboard_router
 from app.core.dependencies import get_current_user, UserModel, supabase, limiter, ErrorResponse, require_role
 # --- 1. Initial Configuration & Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -135,3 +136,4 @@ app.include_router(members_router)
 app.include_router(subscribe_router)
 app.include_router(auth_invite_router)
 app.include_router(account_router)
+app.include_router(dashboard_router)
