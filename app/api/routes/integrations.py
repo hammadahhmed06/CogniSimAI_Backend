@@ -2,28 +2,35 @@
 # Simplified API endpoints for Jira integration
 
 import logging
+import secrets
 from typing import Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.encoders import jsonable_encoder
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from datetime import datetime, timedelta
+import urllib.parse
 
 from app.models.integration_models import (
     ConnectionStatus, IntegrationType, JiraConnectionRequest, JiraConnectionResponse,
     JiraSyncRequest, JiraSyncResponse,
-    IntegrationStatusResponse, AvailableProject
+    IntegrationStatusResponse, AvailableProject, JiraOAuthInitResponse, JiraDisconnectResponse
 )
 from app.services.jira.jira_sync_service import sync_service, JiraSyncService
 from app.services.jira.jira_webhook_handler import webhook_handler
 from app.core.dependencies import get_current_user, UserModel, supabase, limiter
+from app.core.config import Settings
 from pydantic import BaseModel
 
 logger = logging.getLogger("cognisim_ai")
 
 # Create router for integration endpoints
 router = APIRouter(prefix="/api/integrations", tags=["integrations"])
+
+# Load settings
+settings = Settings()
 
 
 def get_workspace_id_from_user(request: Request, current_user: UserModel = Depends(get_current_user)) -> str:
@@ -154,6 +161,255 @@ async def connect_jira(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Connection failed: {str(e)}"
         )
+
+
+@router.get(
+    "/jira/oauth/init",
+    response_model=JiraOAuthInitResponse,
+    summary="Initialize Jira OAuth Flow",
+    description="Start the OAuth flow to connect Jira"
+)
+@limiter.limit("10/minute")
+async def init_jira_oauth(
+    request: Request,
+    workspace_id: str = Depends(get_workspace_id_from_user),
+    current_user: UserModel = Depends(get_current_user)
+) -> JiraOAuthInitResponse:
+    """
+    Initialize OAuth flow for Jira integration.
+    
+    Returns the authorization URL where user should be redirected.
+    """
+    try:
+        # Generate a unique state for CSRF protection
+        state = secrets.token_urlsafe(32)
+        
+        # Store the state with workspace_id and user_id for validation
+        oauth_state_record = {
+            'state': state,
+            'workspace_id': workspace_id,
+            'user_id': str(current_user.id),
+            'created_at': datetime.utcnow().isoformat(),
+            'expires_at': (datetime.utcnow() + timedelta(minutes=10)).isoformat()
+        }
+        
+        # Store in Supabase temporary table
+        supabase.table('oauth_states').insert(oauth_state_record).execute()
+        
+        # Build the authorization URL
+        # Note: Jira uses OAuth 2.0 (3LO - 3-legged OAuth)
+        # Users need to create an OAuth 2.0 app in their Atlassian Developer Console
+        base_auth_url = "https://auth.atlassian.com/authorize"
+        
+        params = {
+            'audience': 'api.atlassian.com',
+            'client_id': settings.JIRA_OAUTH_CLIENT_ID or '',
+            'scope': 'read:jira-user read:jira-work write:jira-work offline_access',
+            'redirect_uri': settings.JIRA_OAUTH_REDIRECT_URI or '',
+            'state': state,
+            'response_type': 'code',
+            'prompt': 'consent'
+        }
+        
+        authorization_url = f"{base_auth_url}?{urllib.parse.urlencode(params)}"
+        
+        logger.info(f"OAuth flow initiated for workspace {workspace_id}")
+        
+        return JiraOAuthInitResponse(
+            authorization_url=authorization_url,
+            state=state
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize OAuth: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to initialize OAuth: {str(e)}"
+        )
+
+
+@router.get(
+    "/jira/oauth/callback",
+    summary="Handle Jira OAuth Callback",
+    description="Process the OAuth callback from Jira"
+)
+async def jira_oauth_callback(
+    code: str = Query(..., description="Authorization code from Jira"),
+    state: str = Query(..., description="State parameter for CSRF protection"),
+    sync_service: JiraSyncService = Depends(get_jira_sync_service)
+):
+    """
+    Handle the OAuth callback from Jira.
+    
+    This endpoint:
+    1. Validates the state parameter
+    2. Exchanges the authorization code for access tokens
+    3. Stores the credentials securely
+    4. Redirects back to the frontend
+    """
+    try:
+        import httpx
+        from app.services.encryption.simple_credential_store import simple_credential_store
+        
+        # Validate state
+        state_result = supabase.table('oauth_states').select('*').eq('state', state).execute()
+        
+        if not state_result.data:
+            logger.error("Invalid OAuth state")
+            return RedirectResponse(
+                url=f"{settings.FRONTEND_URL}/integrations?error=invalid_state"
+            )
+        
+        oauth_state = state_result.data[0]
+        workspace_id = oauth_state['workspace_id']
+        
+        # Check if state expired
+        expires_at = datetime.fromisoformat(oauth_state['expires_at'].replace('Z', '+00:00'))
+        if datetime.utcnow() > expires_at:
+            logger.error("OAuth state expired")
+            return RedirectResponse(
+                url=f"{settings.FRONTEND_URL}/integrations?error=state_expired"
+            )
+        
+        # Exchange code for tokens
+        token_url = "https://auth.atlassian.com/oauth/token"
+        token_data = {
+            'grant_type': 'authorization_code',
+            'client_id': settings.JIRA_OAUTH_CLIENT_ID,
+            'client_secret': settings.JIRA_OAUTH_CLIENT_SECRET.get_secret_value() if settings.JIRA_OAUTH_CLIENT_SECRET else '',
+            'code': code,
+            'redirect_uri': settings.JIRA_OAUTH_REDIRECT_URI
+        }
+        
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(token_url, data=token_data)
+            
+            if token_response.status_code != 200:
+                logger.error(f"Token exchange failed: {token_response.text}")
+                return RedirectResponse(
+                    url=f"{settings.FRONTEND_URL}/integrations?error=token_exchange_failed"
+                )
+            
+            token_data = token_response.json()
+            access_token = token_data.get('access_token')
+            refresh_token = token_data.get('refresh_token')
+            
+            # Get accessible resources (Jira sites)
+            resources_url = "https://api.atlassian.com/oauth/token/accessible-resources"
+            headers = {'Authorization': f'Bearer {access_token}'}
+            resources_response = await client.get(resources_url, headers=headers)
+            
+            if resources_response.status_code != 200:
+                logger.error("Failed to get accessible resources")
+                return RedirectResponse(
+                    url=f"{settings.FRONTEND_URL}/integrations?error=resources_failed"
+                )
+            
+            resources = resources_response.json()
+            if not resources:
+                logger.error("No accessible Jira sites found")
+                return RedirectResponse(
+                    url=f"{settings.FRONTEND_URL}/integrations?error=no_sites"
+                )
+            
+            # Use the first site
+            site = resources[0]
+            jira_url = site.get('url', '')
+            cloud_id = site.get('id', '')
+            
+            # Get user info
+            me_url = f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/myself"
+            me_response = await client.get(me_url, headers=headers)
+            
+            user_email = ""
+            if me_response.status_code == 200:
+                user_data = me_response.json()
+                user_email = user_data.get('emailAddress', '')
+        
+        # Store credentials
+        encrypted_access_token = simple_credential_store.encode_credential(access_token)
+        encrypted_refresh_token = simple_credential_store.encode_credential(refresh_token) if refresh_token else None
+        
+        credential_record = {
+            'workspace_id': workspace_id,
+            'integration_type': 'jira',
+            'jira_url': jira_url,
+            'jira_email': user_email,
+            'jira_api_token_encrypted': encrypted_access_token,
+            'jira_refresh_token_encrypted': encrypted_refresh_token,
+            'jira_cloud_id': cloud_id,
+            'connection_status': 'connected',
+            'last_tested_at': datetime.utcnow().isoformat(),
+            'updated_at': datetime.utcnow().isoformat()
+        }
+        
+        # Check if integration already exists
+        existing = supabase.table('integration_credentials').select('id').eq('workspace_id', workspace_id).eq('integration_type', 'jira').execute()
+        
+        if existing.data:
+            # Update existing
+            supabase.table('integration_credentials').update(credential_record).eq('id', existing.data[0]['id']).execute()
+        else:
+            # Insert new
+            credential_record['created_at'] = datetime.utcnow().isoformat()
+            supabase.table('integration_credentials').insert(credential_record).execute()
+        
+        # Delete used state
+        supabase.table('oauth_states').delete().eq('state', state).execute()
+        
+        logger.info(f"OAuth flow completed for workspace {workspace_id}")
+        
+        # Redirect to frontend with success
+        return RedirectResponse(
+            url=f"{settings.FRONTEND_URL}/integrations?connected=true"
+        )
+        
+    except Exception as e:
+        logger.error(f"OAuth callback failed: {str(e)}", exc_info=True)
+        return RedirectResponse(
+            url=f"{settings.FRONTEND_URL}/integrations?error=callback_failed"
+        )
+
+
+@router.post(
+    "/jira/disconnect",
+    response_model=JiraDisconnectResponse,
+    summary="Disconnect Jira Integration",
+    description="Revoke and delete Jira connection"
+)
+@limiter.limit("5/minute")
+async def disconnect_jira(
+    request: Request,
+    workspace_id: str = Depends(get_workspace_id_from_user),
+    sync_service: JiraSyncService = Depends(get_jira_sync_service)
+) -> JiraDisconnectResponse:
+    """
+    Disconnect Jira integration and remove stored credentials.
+    """
+    try:
+        # Find and delete credentials
+        result = supabase.table('integration_credentials').delete().eq('workspace_id', workspace_id).eq('integration_type', 'jira').execute()
+        
+        if result.data:
+            logger.info(f"Jira integration disconnected for workspace {workspace_id}")
+            return JiraDisconnectResponse(
+                success=True,
+                message="Jira integration disconnected successfully"
+            )
+        else:
+            logger.warning(f"No Jira integration found for workspace {workspace_id}")
+            return JiraDisconnectResponse(
+                success=False,
+                message="No Jira integration found"
+            )
+        
+    except Exception as e:
+        logger.error(f"Failed to disconnect Jira: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to disconnect: {str(e)}"
+        )
+
 
 
 @router.get(

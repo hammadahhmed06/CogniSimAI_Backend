@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # --- OAuth Configuration ---
     GITHUB_LOGIN: Optional[AnyHttpUrl] = None
     GOOGLE_LOGIN: Optional[AnyHttpUrl] = None
+    
+    # --- Jira OAuth Configuration ---
+    JIRA_OAUTH_CLIENT_ID: Optional[str] = None
+    JIRA_OAUTH_CLIENT_SECRET: Optional[SecretStr] = None
+    JIRA_OAUTH_REDIRECT_URI: Optional[str] = None
+    FRONTEND_URL: str = "http://localhost:8080"
 
     # --- CORS Origins ---
     # A list of allowed origins for Cross-Origin Resource Sharing (CORS).

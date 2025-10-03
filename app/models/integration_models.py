@@ -128,3 +128,16 @@ class IntegrationStatusResponse(BaseModel):
     last_tested_at: Optional[datetime]
     last_sync_at: Optional[datetime]
     available_projects: List[AvailableProject] = Field(default=[], description="Available Jira projects")
+
+
+class JiraOAuthInitResponse(BaseModel):
+    """Response for OAuth initiation"""
+    authorization_url: str
+    state: str
+
+
+class JiraDisconnectResponse(BaseModel):
+    """Response for disconnecting Jira"""
+    success: bool
+    message: str
+
