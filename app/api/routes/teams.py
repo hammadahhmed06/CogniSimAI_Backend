@@ -2,6 +2,7 @@ from uuid import UUID, uuid4
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 import os
+import logging
 from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr
@@ -49,6 +50,7 @@ from app.models.team_models import (
 )
 
 router = APIRouter(prefix="/api/teams", tags=["teams"])
+logger = logging.getLogger("cognisim_ai")
 
 
 # ---------- Models ----------
@@ -594,10 +596,12 @@ async def get_team_workload(
             user_name = user_result.user.user_metadata.get("full_name", user_email) if user_result.user else user_email
             
             # Get assigned issues count
+            # Note: issues table uses assignee_name (string), not assignee_id (foreign key)
+            # We filter by assignee_name matching the user's email
             issues_result = supabase.table("issues")\
                 .select("id, status, story_points")\
                 .eq("team_id", str(team_id))\
-                .eq("assignee_id", user_id)\
+                .eq("assignee_name", user_email)\
                 .neq("status", "done")\
                 .execute()
             
@@ -958,30 +962,30 @@ async def get_team_settings(
 ):
     """Get team configuration settings"""
     try:
+        # Query without .single() to avoid 406 error when no rows exist
         result = supabase.table("team_settings")\
             .select("*")\
             .eq("team_id", str(team_id))\
-            .single()\
             .execute()
         
-        if not result.data:
-            # Create default settings if not exists
+        # If no settings exist, create default ones
+        if not result.data or len(result.data) == 0:
             default_settings = {
                 "team_id": str(team_id),
                 "timezone": "UTC",
                 "working_hours_start": "09:00:00",
                 "working_hours_end": "17:00:00",
-                "working_days": [1, 2, 3, 4, 5],
                 "sprint_length_days": 14,
                 "velocity_tracking_enabled": True
             }
-            result = supabase.table("team_settings")\
+            insert_result = supabase.table("team_settings")\
                 .insert(default_settings)\
                 .execute()
-            return result.data[0]
+            return insert_result.data[0]
         
-        return result.data
+        return result.data[0]
     except Exception as e:
+        logger.error(f"Failed to fetch team settings: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch team settings: {str(e)}")
 
 
@@ -1223,18 +1227,18 @@ async def get_notification_settings(
 ):
     """Get user's notification preferences for this team"""
     try:
+        # Try to get existing settings
         result = supabase.table("team_notification_settings")\
             .select("*")\
             .eq("team_id", str(team_id))\
-            .eq("user_id", current_user.id)\
-            .single()\
+            .eq("user_id", str(current_user.id))\
             .execute()
         
-        if not result.data:
-            # Create default settings
+        # If no settings exist, create default ones
+        if not result.data or len(result.data) == 0:
             default_settings = {
                 "team_id": str(team_id),
-                "user_id": current_user.id,
+                "user_id": str(current_user.id),
                 "email_daily_digest": True,
                 "email_sprint_summary": True,
                 "email_mentions": True,
@@ -1242,13 +1246,14 @@ async def get_notification_settings(
                 "slack_notifications": False,
                 "slack_webhook_url": None
             }
-            result = supabase.table("team_notification_settings")\
+            insert_result = supabase.table("team_notification_settings")\
                 .insert(default_settings)\
                 .execute()
-            return result.data[0]
+            return insert_result.data[0]
         
-        return result.data
+        return result.data[0]
     except Exception as e:
+        logger.error(f"Failed to fetch notification settings: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch notification settings: {str(e)}")
 
 
