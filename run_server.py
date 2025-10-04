@@ -13,7 +13,7 @@ if __name__ == "__main__":
     # Run the server
     uvicorn.run(
         "app.main:app",  # Use import string for reload
-        host="127.0.0.1",  # localhost for easier access
+        host="localhost",  # localhost for easier access
         port=8000,
         reload=True,  # Enable reload for development
         log_level="info"

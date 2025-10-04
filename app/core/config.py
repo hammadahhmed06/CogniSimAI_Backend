@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     JIRA_OAUTH_CLIENT_SECRET: Optional[SecretStr] = None
     JIRA_OAUTH_REDIRECT_URI: Optional[str] = None
     FRONTEND_URL: str = "http://localhost:8080"
+    
+    # --- Slack OAuth Configuration ---
+    SLACK_CLIENT_ID: Optional[str] = None
+    SLACK_CLIENT_SECRET: Optional[SecretStr] = None
+    SLACK_REDIRECT_URI: Optional[str] = None  # e.g., http://localhost:8000/api/slack/oauth/callback
 
     # --- CORS Origins ---
     # A list of allowed origins for Cross-Origin Resource Sharing (CORS).
