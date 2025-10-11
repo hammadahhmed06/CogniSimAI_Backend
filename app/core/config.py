@@ -69,6 +69,9 @@ class Settings(BaseSettings):
 # Create a single, importable instance of the settings
 settings = Settings()
 
-# Validate that required settings are provided
-if settings.SUPABASE_URL is None or settings.SUPABASE_SERVICE_ROLE_KEY is None:
-    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
+# Validate that required settings are provided - only in production
+if not settings.DEV_MODE:
+    if settings.SUPABASE_URL is None or settings.SUPABASE_SERVICE_ROLE_KEY is None:
+        import logging
+        logging.warning("⚠️ SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY should be set in environment variables")
+        logging.warning("⚠️ Please add environment variables in Railway Dashboard → Variables")
