@@ -82,9 +82,30 @@ async def startup_event():
 
 # --- 3. API Endpoints ---
 
-@app.get("/", summary="Health Check", tags=["System"])
+@app.get("/", summary="Root Endpoint", tags=["System"])
 async def root():
     return {"status": "CogniSim AI Backend is running"}
+
+@app.get("/health", summary="Health Check for Railway", tags=["System"])
+async def health_check():
+    """
+    Health check endpoint for Railway and monitoring services.
+    Returns 200 OK if the service is healthy.
+    """
+    try:
+        # Optional: Add database connectivity check
+        # supabase.table("users").select("id").limit(1).execute()
+        return {
+            "status": "healthy",
+            "service": settings.APP_NAME,
+            "version": settings.APP_VERSION
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service unhealthy"
+        )
 
 @app.get("/api/profile", response_model=UserModel, summary="Get Current User's Profile", tags=["User"])
 @limiter.limit("10/minute")
