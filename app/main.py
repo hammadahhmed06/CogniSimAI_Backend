@@ -74,8 +74,12 @@ async def startup_event():
     This function runs once when the application starts.
     It loads the feature flags from the database into the cache.
     """
-    load_feature_flags(supabase)
-    logger.info("Application startup complete. Feature flags loaded.")
+    try:
+        load_feature_flags(supabase)
+        logger.info("Application startup complete. Feature flags loaded.")
+    except Exception as e:
+        logger.error(f"Failed to load feature flags: {str(e)}")
+        logger.warning("Application starting without feature flags. Some features may be unavailable.")
 
 # --- 2. Dependencies imported from app.core.dependencies to avoid circular imports ---
 
